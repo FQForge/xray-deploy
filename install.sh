@@ -52,10 +52,9 @@ if ! command -v bash >/dev/null 2>&1; then
   exit 1
 fi
 
-# 统一安装为 xnode；对 v0.7 或更早版本的已安装 xss 保留兼容别名。
-# XSS_ENTRY 用于兼容旧版环境变量和本地测试，不影响用户使用 xnode。
+# 对外只提供 xnode 管理命令；内部 XSS_ENTRY 仍用于测试自定义安装位置。
 TARGET="${XSS_ENTRY:-/usr/local/bin/xnode}"
-LEGACY_ENTRY="${XSS_LEGACY_ENTRY:-$(dirname "$TARGET")/xss}"
+OLD_ENTRY="$(dirname "$TARGET")/xss"
 
 authentic_manager() {
   [ -f "$1" ] && grep -Fq '# Xray SS Manager:' "$1"
@@ -89,24 +88,17 @@ else
   printf '%s\n' "[+] Xray 管理命令已经是最新版：$TARGET。"
 fi
 
-# 只有在以前确实安装过本项目的 xss 时，才创建兼容别名。
-# 不覆盖无关程序，也不创建新的 xss 命令（新安装只用 xnode）。
-if [ "$LEGACY_ENTRY" != "$TARGET" ]; then
-  if [ -L "$LEGACY_ENTRY" ]; then
-    if [ "$(readlink "$LEGACY_ENTRY")" != "$TARGET" ]; then
-      printf '%s\n' "[!] 已有其他符号链接：$LEGACY_ENTRY，保留不变。" >&2
+# 不再保留旧版 xss 命令。仅删除本项目创建的旧脚本/旧符号链接，
+# 不碰属于其他程序的同名文件。
+if [ "$OLD_ENTRY" != "$TARGET" ]; then
+  if [ -L "$OLD_ENTRY" ]; then
+    if [ "$(readlink "$OLD_ENTRY")" = "$TARGET" ]; then
+      rm -f "$OLD_ENTRY"
+      printf '%s\n' '[+] 已清理旧版 xss 命令。'
     fi
-  elif [ -e "$LEGACY_ENTRY" ]; then
-    if authentic_manager "$LEGACY_ENTRY"; then
-      legacy_dir=$(dirname "$LEGACY_ENTRY")
-      temp_alias=$(mktemp "$legacy_dir/.xnode-alias.XXXXXX") || exit 1
-      rm -f "$temp_alias"
-      ln -s "$TARGET" "$temp_alias" || exit 1
-      mv -f "$temp_alias" "$LEGACY_ENTRY"
-      printf '%s\n' "[+] 检测到旧版 xss，已为其保留兼容入口；今后请使用 xnode。"
-    else
-      printf '%s\n' "[!] 检测到非本项目的 $LEGACY_ENTRY，未修改它。" >&2
-    fi
+  elif [ -f "$OLD_ENTRY" ] && authentic_manager "$OLD_ENTRY"; then
+    rm -f "$OLD_ENTRY"
+    printf '%s\n' '[+] 已清理旧版 xss 命令。'
   fi
 fi
 

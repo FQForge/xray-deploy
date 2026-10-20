@@ -13,7 +13,6 @@ OPT_DIR="${XSS_OPT_DIR:-/opt/xray-ss}"
 CORE_DIR="$OPT_DIR/versions"
 CORE_LINK="${XSS_CORE_LINK:-/usr/local/bin/xray-ss-core}"
 ENTRY="${XSS_ENTRY:-/usr/local/bin/xnode}"
-LEGACY_ENTRY="${XSS_LEGACY_ENTRY:-$(dirname "$ENTRY")/xss}"
 CONFIG="$ETC_DIR/config.json"
 HOST_FILE="$ETC_DIR/host.txt"
 BACKUP_DIR="$ETC_DIR/backups"
@@ -988,10 +987,15 @@ uninstall_manager() {
     manual) rm -f "$MANUAL_UNIT_FILE" ;;
   esac
   rm -f "$ENTRY"
-  # Only remove the old xss compatibility alias when it points to our new launcher.
-  if [[ "$LEGACY_ENTRY" != "$ENTRY" && -L "$LEGACY_ENTRY" ]] &&
-     [[ "$(readlink "$LEGACY_ENTRY")" == "$ENTRY" ]]; then
-    rm -f "$LEGACY_ENTRY"
+  # 卸载时也清理本项目留下的旧 xss 命令，保留其他程序的同名文件。
+  local old_entry
+  old_entry="$(dirname "$ENTRY")/xss"
+  if [[ "$old_entry" != "$ENTRY" ]]; then
+    if [[ -L "$old_entry" ]]; then
+      [[ "$(readlink "$old_entry")" == "$ENTRY" ]] && rm -f "$old_entry"
+    elif [[ -f "$old_entry" ]] && grep -Fq '# Xray SS Manager:' "$old_entry"; then
+      rm -f "$old_entry"
+    fi
   fi
   if [[ -L "$CORE_LINK" ]] && [[ "$(readlink "$CORE_LINK")" == "$CORE_DIR"/* ]]; then rm -f "$CORE_LINK"; fi
   rm -rf "$ETC_DIR" "$OPT_DIR"
@@ -1038,7 +1042,7 @@ menu() {
 
 usage() {
   cat <<'TXT'
-Xray 中文节点管理系统（SS / SS2022，v0.8）
+Xray 中文节点管理系统（SS / SS2022，v0.8.1）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
       sudo xnode links         # 查看所有节点分享链接
