@@ -1044,7 +1044,7 @@ show_node_connection() {
 # 使用 jq 构建 JSON，避免中文节点名、Base64 密钥等内容被手工拼接破坏。
 # 配置沿用 Xray 兼容的 settings.servers 形式，以便旧版 3x-ui 手动添加出站。
 make_node_outbound_json() {
-  local tag="$1" host json
+  local tag="$1" host json display_tag
   [[ -s "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
   if ! jq -e --arg t "$tag" '
       .inbounds[]? |
@@ -1056,11 +1056,13 @@ make_node_outbound_json() {
     return 1
   fi
   host="$(node_share_host "$tag")" || return 1
-  json="$(jq -e --arg t "$tag" --arg host "$host" '
+  # 出站 tag 与菜单显示的节点名称一致；兼容旧 xss- 节点的显示名 ss-。
+  display_tag="$(visible_node_name "$tag")" || return 1
+  json="$(jq -e --arg t "$tag" --arg host "$host" --arg display_tag "$display_tag" '
     .inbounds[]? |
     select(.tag==$t and .protocol=="shadowsocks" and .settings.users==null) |
     {
-      tag: ("ss-out-" + (.port|tostring)),
+      tag: $display_tag,
       protocol: "shadowsocks",
       settings: {
         servers: [{
@@ -1238,7 +1240,7 @@ menu() {
 
 usage() {
   cat <<'TXT'
-Xray 中文节点管理系统（SS / SS2022，v0.10.0）
+Xray 中文节点管理系统（SS / SS2022，v0.10.1）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
       sudo xnode links         # 查看所有节点分享链接
