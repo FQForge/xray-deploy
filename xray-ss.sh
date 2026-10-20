@@ -1040,6 +1040,55 @@ show_node_connection() {
   warn '分享链接包含节点密码，请妥善保管。'
 }
 
+# 从节点真实入站配置生成可复制到 Xray outbounds 数组中的单个出站对象。
+# 使用 jq 构建 JSON，避免中文节点名、Base64 密钥等内容被手工拼接破坏。
+# 配置沿用 Xray 兼容的 settings.servers 形式，以便旧版 3x-ui 手动添加出站。
+make_node_outbound_json() {
+  local tag="$1" host json
+  [[ -s "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
+  if ! jq -e --arg t "$tag" '
+      .inbounds[]? |
+      select(.tag==$t and .protocol=="shadowsocks" and .settings.users==null and
+             (.port|type)=="number" and (.settings.method|type)=="string" and
+             (.settings.password|type)=="string")
+    ' "$CONFIG" >/dev/null; then
+    fail '当前节点不是可导出的单用户 SS / SS2022 节点，无法生成出站 JSON。'
+    return 1
+  fi
+  host="$(node_share_host "$tag")" || return 1
+  json="$(jq -e --arg t "$tag" --arg host "$host" '
+    .inbounds[]? |
+    select(.tag==$t and .protocol=="shadowsocks" and .settings.users==null) |
+    {
+      tag: ("ss-out-" + (.port|tostring)),
+      protocol: "shadowsocks",
+      settings: {
+        servers: [{
+          address: $host,
+          port: .port,
+          method: .settings.method,
+          password: .settings.password
+        }]
+      }
+    }
+  ' "$CONFIG")" || { fail '生成出站 JSON 失败。'; return 1; }
+  [[ -n "$json" ]] || { fail '生成出站 JSON 失败：未找到目标节点。'; return 1; }
+  printf '%s\n' "$json"
+}
+
+show_node_outbound_json() {
+  local tag="$1" json
+  json="$(make_node_outbound_json "$tag")" || return 1
+  say ''
+  say '========== Xray 出站 JSON =========='
+  say "节点名称：$(visible_node_name "$tag")"
+  say '复制下面完整的 JSON 对象，添加到 3x-ui 的 Xray 配置 outbounds 数组中：'
+  printf '%s\n' "$json"
+  say '===================================' 
+  say '提示：这是一条出站对象，不是完整的 Xray 配置文件；如需走该出口，请配置相应路由。'
+  warn '出站 JSON 包含节点密码，请勿公开分享。'
+}
+
 show_links() {
   [[ -f "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
   local host tag display port method password nickname
@@ -1061,11 +1110,24 @@ show_links() {
 view_node_connections() {
   list_nodes || return 1
   [[ -f "$CONFIG" ]] && jq -e '.inbounds | length>0' "$CONFIG" >/dev/null || return 0
-  local node_name tag
-  read -r -p '请输入要显示连接信息的节点名称（直接回车返回）：' node_name || return 0
+  local node_name tag choice
+  read -r -p '请输入要查看的节点名称（直接回车返回）：' node_name || return 0
   [[ -n "$node_name" ]] || return 0
   tag="$(resolve_node_tag "$node_name")" || return 1
-  show_node_connection "$tag"
+  while :; do
+    say ''
+    say '========== 请选择查看方式 =========='
+    say '1）查看 SS / SS2022 连接链接'
+    say '2）查看 Xray 出站 JSON（用于 3x-ui 手动添加出站）'
+    say '0）返回上级菜单'
+    read -r -p '请输入选项（1/2/0）：' choice || return 0
+    case "$choice" in
+      1) show_node_connection "$tag"; return $? ;;
+      2) show_node_outbound_json "$tag"; return $? ;;
+      0|'') return 0 ;;
+      *) warn '请输入 1、2 或 0。' ;;
+    esac
+  done
 }
 
 status() {
@@ -1145,7 +1207,7 @@ menu() {
     say " 1）安装或切换 Xray 内核版本（默认 $DEFAULT_XRAY_VERSION）"
     say ' 2）添加 SS / SS2022 节点（完成后显示连接信息）'
     say ' 3）查看已有节点'
-    say ' 4）查看节点连接信息'
+    say ' 4）查看节点连接信息 / 出站 JSON'
     say ' 5）修改节点端口'
     say ' 6）删除节点'
     say ' 7）查看服务运行状态'
@@ -1176,12 +1238,12 @@ menu() {
 
 usage() {
   cat <<'TXT'
-Xray 中文节点管理系统（SS / SS2022，v0.9.0）
+Xray 中文节点管理系统（SS / SS2022，v0.10.0）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
       sudo xnode links         # 查看所有节点分享链接
       sudo xnode list          # 查看已有节点
-      sudo xnode show          # 选择节点显示连接信息
+      sudo xnode show          # 选择节点，查看分享链接或出站 JSON
       sudo xnode status        # 查看服务状态
       sudo xnode logs          # 查看运行日志
       sudo xnode install-default   # 安装默认 Xray 内核版本 v26.6.1
