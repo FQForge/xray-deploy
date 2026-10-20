@@ -14,7 +14,8 @@ CORE_DIR="$OPT_DIR/versions"
 CORE_LINK="${XSS_CORE_LINK:-/usr/local/bin/xray-ss-core}"
 ENTRY="${XSS_ENTRY:-/usr/local/bin/xnode}"
 CONFIG="$ETC_DIR/config.json"
-HOST_FILE="$ETC_DIR/host.txt"
+HOST_FILE="$ETC_DIR/host.txt"    # 旧版全局连接地址：仅用于读取旧节点
+NODE_HOSTS_FILE="$ETC_DIR/node-hosts.json"
 BACKUP_DIR="$ETC_DIR/backups"
 UNIT_FILE="${XSS_UNIT_FILE:-/etc/systemd/system/$SERVICE}"
 OPENRC_UNIT_FILE="${XSS_OPENRC_UNIT_FILE:-/etc/init.d/xray-ss}"
@@ -192,6 +193,10 @@ init_config() {
   if [[ ! -f "$CONFIG" ]]; then
     printf '%s\n' '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom"}]}' > "$CONFIG"
     chmod 600 "$CONFIG"
+  fi
+  if [[ ! -f "$NODE_HOSTS_FILE" ]]; then
+    printf '{}\n' > "$NODE_HOSTS_FILE"
+    chmod 600 "$NODE_HOSTS_FILE"
   fi
   if [[ ! -e "$ENTRY" && ! -L "$ENTRY" ]]; then
     # Install a copy, so this manager remains available after removing the download.
@@ -757,7 +762,7 @@ apply_config() {
 add_node() {
   ensure_core_for_new_node || return 1
   init_config
-  local name tag method port network pass node tmp
+  local name tag method port network pass node tmp host
   read -r -p '请输入节点名称（支持中文、英文及常见符号，最多 48 个字符）：' name
   safe_name "$name" || { fail '节点名称无效：需为 1～48 个字符，不能包含控制字符、斜杠或首尾空格。'; return 1; }
   tag="ss-$name"
@@ -766,6 +771,7 @@ add_node() {
   fi
   method="$(choose_method)" || return 1
   port="$(choose_port)" || return 1
+  host="$(choose_node_host)" || return 1
   network="tcp,udp"
 
   # 每次仅创建一个带独立密码的节点；不再询问单用户/多用户模式。
@@ -775,7 +781,12 @@ add_node() {
     '{tag:$tag,listen:"0.0.0.0",port:$port,protocol:"shadowsocks",settings:{method:$method,password:$pass,network:$network}}')" || return 1
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")" || return 1
   jq --argjson node "$node" '.inbounds += [$node]' "$CONFIG" > "$tmp" || { rm -f "$tmp"; return 1; }
-  apply_config "$tmp" || return 1
+  # 先记录当前节点的独立地址；若配置校验或启动失败则删除该记录。
+  if ! save_node_host "$tag" "$host"; then rm -f "$tmp"; return 1; fi
+  if ! apply_config "$tmp"; then
+    remove_node_host "$tag" || warn '服务创建失败，且独立连接地址记录未能清理。'
+    return 1
+  fi
   info "已创建节点：$tag，端口 $port，加密方式 $method。"
   warn "请在 VPS 服务商安全组和服务器防火墙中放行端口 $port（$network）。"
 
@@ -821,35 +832,162 @@ delete_node() {
   [[ "$yes" == "确认删除" ]] || return 0
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")"
   jq --arg t "$tag" '.inbounds |= map(select(.tag!=$t))' "$CONFIG" > "$tmp"
-  apply_config "$tmp"
-}
-
-set_host() {
-  init_config
-  local host
-  read -r -p '请输入分享链接所用的公网 IPv4、IPv6 或 DDNS 域名：' host
-  host="${host#[}"
-  host="${host%]}"
-  if [[ ! "$host" =~ ^[a-zA-Z0-9.:-]{1,253}$ ]]; then
-    fail '地址无效：请填写 IP 地址或英文 DDNS 域名，不要包含协议头和端口。'; return 1
+  if apply_config "$tmp"; then
+    remove_node_host "$tag" || warn '节点已删除，但独立连接地址记录清理失败。'
+  else
+    return 1
   fi
-  printf '%s\n' "$host" > "$HOST_FILE"
-  chmod 600 "$HOST_FILE"
-  info "已保存分享链接地址：$host"
 }
 
-ensure_host() {
-  if [[ ! -s "$HOST_FILE" ]]; then
-    local detected=''
-    detected="$(curl -4fsSL --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-    if [[ "$detected" =~ ^[0-9.]+$ ]]; then
-      printf '%s\n' "$detected" > "$HOST_FILE"
-      chmod 600 "$HOST_FILE"
-      info "自动检测到公网 IPv4：$detected" >&2
-    else
-      set_host >&2
+# 地址仅用于生成 ss:// 分享链接，Xray 仍监听所有地址。
+# 新节点的地址按节点标签分别存入 node-hosts.json，互不干扰。
+valid_ipv4() {
+  local ip="$1" item
+  local -a parts
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS=. read -r -a parts <<< "$ip"
+  ((${#parts[@]} == 4)) || return 1
+  for item in "${parts[@]}"; do
+    ((${#item} <= 3)) || return 1
+    ((10#$item <= 255)) || return 1
+  done
+}
+
+valid_ipv6() {
+  local ip="$1" left right part compressed=0
+  local -a groups=()
+  [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ && "$ip" != *:::* ]] || return 1
+  if [[ "$ip" == *::* ]]; then
+    [[ "${ip#*::}" != *::* ]] || return 1
+    compressed=1
+    left="${ip%%::*}"
+    right="${ip#*::}"
+    if [[ -n "$left" ]]; then
+      IFS=: read -r -a groups <<< "$left"
     fi
+    [[ "$ip" != :* || "$ip" == ::* ]] || return 1
+    [[ "$ip" != *: || "$ip" == *:: ]] || return 1
+    if [[ -n "$right" ]]; then
+      local -a tail=()
+      IFS=: read -r -a tail <<< "$right"
+      groups+=("${tail[@]}")
+    fi
+  else
+    [[ "$ip" != :* && "$ip" != *: ]] || return 1
+    IFS=: read -r -a groups <<< "$ip"
   fi
+  for part in "${groups[@]}"; do
+    [[ "$part" =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+  done
+  if ((compressed)); then
+    ((${#groups[@]} < 8))
+  else
+    ((${#groups[@]} == 8))
+  fi
+}
+
+valid_domain() {
+  local host="$1" label
+  local -a labels=()
+  [[ ${#host} -ge 3 && ${#host} -le 253 && "$host" == *.* ]] || return 1
+  [[ "$host" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+  # 域名不能是纯数字的伪 IPv4 地址。
+  [[ ! "$host" =~ ^[0-9.]+$ ]] || return 1
+  IFS=. read -r -a labels <<< "$host"
+  [[ "$host" != *. && "$host" != .* && "$host" != *..* ]] || return 1
+  ((${#labels[@]} >= 2)) || return 1
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+  done
+  # 顶级域名只允许英文（含 punycode）以避免误将非法地址保存为域名。
+  [[ "${labels[${#labels[@]}-1]}" =~ [a-zA-Z] ]]
+}
+
+valid_share_host() { valid_ipv4 "$1" || valid_ipv6 "$1" || valid_domain "$1"; }
+
+detect_public_host() {
+  local ip
+  ip="$(curl -4fsSL --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  if valid_ipv4 "$ip"; then printf '%s\n' "$ip"; return 0; fi
+  ip="$(curl -6fsSL --connect-timeout 4 --max-time 8 https://api6.ipify.org 2>/dev/null || true)"
+  if valid_ipv6 "$ip"; then printf '%s\n' "$ip"; return 0; fi
+  return 1
+}
+
+choose_node_host() {
+  local answer host
+  read -r -p '此节点是否使用域名（含 DDNS）作为连接地址？[y/N]：' answer || return 1
+  case "$answer" in
+    y|Y|yes|YES|是)
+      read -r -p '请输入已解析到此 VPS 的域名（如 ss.example.com）：' host || return 1
+      if ! valid_domain "$host"; then
+        fail '域名格式不正确，请只输入域名，不要包含 http://、端口、路径或空格。'
+        return 1
+      fi
+      info "此节点将使用域名：$host" >&2
+      warn '请自行确认域名 DNS 已指向该服务器；这里只修改分享链接，不配置 DNS 或 TLS。' >&2
+      ;;
+    ''|n|N|no|NO|否)
+      if host="$(detect_public_host)"; then
+        info "已自动获取服务器公网 IP：$host" >&2
+      else
+        warn '无法自动获取公网 IP，请手动输入服务器的公网 IPv4 或 IPv6。' >&2
+        read -r -p '请输入公网 IP（IPv4 或 IPv6，直接回车取消创建）：' host || return 1
+        # 兼容粘贴带方括号的 IPv6 地址（如 [2001:db8::1]）。
+        if [[ "$host" == \[*\] ]]; then
+          host="${host#[}"
+          host="${host%]}"
+        fi
+        (valid_ipv4 "$host" || valid_ipv6 "$host") || { fail '公网 IP 格式不正确。'; return 1; }
+      fi
+      ;;
+    *) fail '请选择 y 或 n（直接回车默认使用公网 IP）。'; return 1 ;;
+  esac
+  printf '%s\n' "$host"
+}
+
+save_node_host() {
+  local tag="$1" host="$2" tmp
+  valid_share_host "$host" || { fail '节点连接地址无效，未保存。'; return 1; }
+  tmp="$(mktemp "$ETC_DIR/.node-hosts.XXXXXX")" || return 1
+  if ! jq -e --arg t "$tag" --arg h "$host" '.[$t]=$h' "$NODE_HOSTS_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    fail '无法保存节点连接地址。'
+    return 1
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$NODE_HOSTS_FILE"
+}
+
+remove_node_host() {
+  local tag="$1" tmp
+  [[ -f "$NODE_HOSTS_FILE" ]] || return 0
+  tmp="$(mktemp "$ETC_DIR/.node-hosts.XXXXXX")" || return 1
+  if ! jq -e --arg t "$tag" 'del(.[$t])' "$NODE_HOSTS_FILE" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$NODE_HOSTS_FILE"
+}
+
+node_share_host() {
+  local tag="$1" host=''
+  if [[ -s "$NODE_HOSTS_FILE" ]]; then
+    host="$(jq -er --arg t "$tag" '.[$t] // empty' "$NODE_HOSTS_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -n "$host" ]]; then
+    valid_share_host "$host" || { fail "节点 $tag 保存的连接地址无效。"; return 1; }
+    printf '%s\n' "$host"
+    return 0
+  fi
+  # 旧节点未保存独立地址时，沿用旧版 host.txt，不修改已有节点或密码。
+  if [[ -s "$HOST_FILE" ]]; then
+    host="$(tr -d '\r\n' < "$HOST_FILE")"
+    if valid_share_host "$host"; then printf '%s\n' "$host"; return 0; fi
+  fi
+  detect_public_host || fail "无法确定节点 $tag 的公网地址。"
 }
 
 # SIP002: legacy AEAD uses base64url userinfo; SS2022 MUST use plain percent-encoded userinfo.
@@ -889,11 +1027,10 @@ show_node_connection() {
   say "加密方式：$method"
   say "传输方式：$network_zh"
   say "连接密码：$password"
-  if ! ensure_host; then
-    warn '节点已成功创建，但公网地址尚未设置。请选择菜单 7 设置公网 IP / DDNS 后，再使用菜单 4 查看分享链接。'
-    return 0
-  fi
-  host="$(cat "$HOST_FILE")"
+  host="$(node_share_host "$tag")" || {
+    warn '无法生成连接链接：没有可用的服务器公网地址。'
+    return 1
+  }
   uri="$(make_ss_uri "$method" "$password" "$host" "$port" "$display")" || return 1
   say "服务器地址：$host"
   say ''
@@ -905,11 +1042,10 @@ show_node_connection() {
 
 show_links() {
   [[ -f "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
-  ensure_host || return 1
-  local host tag display port method password nickname line
-  host="$(cat "$HOST_FILE")"
+  local host tag display port method password nickname
   while IFS=$'\t' read -r tag port method password nickname; do
     [[ -n "$tag" ]] || continue
+    host="$(node_share_host "$tag")" || { warn "节点 $tag 的分享链接生成失败，已跳过。"; continue; }
     display="$(visible_node_name "$tag")"
     if [[ "$nickname" == '节点' ]]; then
       printf '\n%s\n' "$display"
@@ -1012,12 +1148,11 @@ menu() {
     say ' 4）查看节点连接信息'
     say ' 5）修改节点端口'
     say ' 6）删除节点'
-    say ' 7）设置分享链接所用公网 IP / DDNS'
-    say ' 8）查看服务运行状态'
-    say ' 9）查看运行日志'
-    say '10）重启 Xray 服务'
-    say '11）完全卸载管理脚本及受管服务'
-    say '12）检测 Linux 系统兼容性'
+    say ' 7）查看服务运行状态'
+    say ' 8）查看运行日志'
+    say ' 9）重启 Xray 服务'
+    say '10）完全卸载管理脚本及受管服务'
+    say '11）检测 Linux 系统兼容性'
     say ' 0）退出管理系统'
     local ans tag
     read -r -p '请输入菜单序号：' ans || return 0
@@ -1028,12 +1163,11 @@ menu() {
       4) view_node_connections || true ;;
       5) change_port || true ;;
       6) delete_node || true ;;
-      7) set_host || true ;;
-      8) status || true ;;
-      9) logs || true ;;
-      10) if service_restart && service_is_active; then info 'Xray 服务已重启。'; else warn 'Xray 服务重启失败，请查看运行日志。'; fi ;;
-      11) if uninstall_manager; then return 0; fi ;;
-      12) check_compatibility || true ;;
+      7) status || true ;;
+      8) logs || true ;;
+      9) if service_restart && service_is_active; then info 'Xray 服务已重启。'; else warn 'Xray 服务重启失败，请查看运行日志。'; fi ;;
+      10) if uninstall_manager; then return 0; fi ;;
+      11) check_compatibility || true ;;
       0) return 0 ;;
       *) warn '菜单选项无效，请重新选择。' ;;
     esac
@@ -1042,7 +1176,7 @@ menu() {
 
 usage() {
   cat <<'TXT'
-Xray 中文节点管理系统（SS / SS2022，v0.8.1）
+Xray 中文节点管理系统（SS / SS2022，v0.9.0）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
       sudo xnode links         # 查看所有节点分享链接
