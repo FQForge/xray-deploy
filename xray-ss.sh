@@ -12,7 +12,8 @@ ETC_DIR="${XSS_ETC_DIR:-/etc/xray-ss}"
 OPT_DIR="${XSS_OPT_DIR:-/opt/xray-ss}"
 CORE_DIR="$OPT_DIR/versions"
 CORE_LINK="${XSS_CORE_LINK:-/usr/local/bin/xray-ss-core}"
-ENTRY="${XSS_ENTRY:-/usr/local/bin/xss}"
+ENTRY="${XSS_ENTRY:-/usr/local/bin/xnode}"
+LEGACY_ENTRY="${XSS_LEGACY_ENTRY:-$(dirname "$ENTRY")/xss}"
 CONFIG="$ETC_DIR/config.json"
 HOST_FILE="$ETC_DIR/host.txt"
 BACKUP_DIR="$ETC_DIR/backups"
@@ -872,7 +873,7 @@ show_node_connection() {
   [[ -s "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
   # 旧版创建的多用户节点不会被转换或删除，历史链接仍可通过 links 命令获取。
   fields="$(jq -er --arg tag "$tag" '.inbounds[]? | select(.tag==$tag and .settings.users==null) | [.tag, (.port|tostring), .settings.method, .settings.password, (.settings.network // "tcp")] | @tsv' "$CONFIG")" || {
-    fail '未找到可独立显示连接信息的节点；如为旧版多用户节点，请使用 xss links 查看原有链接。'
+    fail '未找到可独立显示连接信息的节点；如为旧版多用户节点，请使用 xnode links 查看原有链接。'
     return 1
   }
   IFS=$'\t' read -r name port method password network <<< "$fields"
@@ -987,6 +988,11 @@ uninstall_manager() {
     manual) rm -f "$MANUAL_UNIT_FILE" ;;
   esac
   rm -f "$ENTRY"
+  # Only remove the old xss compatibility alias when it points to our new launcher.
+  if [[ "$LEGACY_ENTRY" != "$ENTRY" && -L "$LEGACY_ENTRY" ]] &&
+     [[ "$(readlink "$LEGACY_ENTRY")" == "$ENTRY" ]]; then
+    rm -f "$LEGACY_ENTRY"
+  fi
   if [[ -L "$CORE_LINK" ]] && [[ "$(readlink "$CORE_LINK")" == "$CORE_DIR"/* ]]; then rm -f "$CORE_LINK"; fi
   rm -rf "$ETC_DIR" "$OPT_DIR"
   rm -f "$LOG_FILE" "$PID_FILE"
@@ -995,7 +1001,7 @@ uninstall_manager() {
 
 menu() {
   while :; do
-    printf '\n========== Xray SS / SS2022 节点管理系统 ==========\n'
+    printf '\n========== Xray 节点管理系统（SS / SS2022） ==========\n'
     say " 1）安装或切换 Xray 内核版本（默认 $DEFAULT_XRAY_VERSION）"
     say ' 2）添加 SS / SS2022 节点（完成后显示连接信息）'
     say ' 3）查看已有节点'
@@ -1032,15 +1038,15 @@ menu() {
 
 usage() {
   cat <<'TXT'
-Xray SS / SS2022 中文节点管理系统（v0.7）
+Xray 中文节点管理系统（SS / SS2022，v0.8）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
-      sudo xss               # 首次安装后打开菜单
-      sudo xss links         # 查看所有节点分享链接
-      sudo xss list          # 查看已有节点
-      sudo xss show          # 选择节点显示连接信息
-      sudo xss status        # 查看服务状态
-      sudo xss logs          # 查看运行日志
-      sudo xss install-default   # 安装默认 Xray 内核版本 v26.6.1
+      sudo xnode               # 首次安装后打开菜单
+      sudo xnode links         # 查看所有节点分享链接
+      sudo xnode list          # 查看已有节点
+      sudo xnode show          # 选择节点显示连接信息
+      sudo xnode status        # 查看服务状态
+      sudo xnode logs          # 查看运行日志
+      sudo xnode install-default   # 安装默认 Xray 内核版本 v26.6.1
       bash xray-ss.sh check # 检测系统兼容性（无须 root）
 支持多种 Linux 发行版；服务管理方式：systemd / OpenRC / SysVinit / runit / procd / 手动。
 支持的 CPU 架构取决于 Xray 官方发布包；不支持的架构会在安装前提示。

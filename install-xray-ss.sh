@@ -1,18 +1,18 @@
 #!/bin/sh
 # GitHub 一键安装入口：与 `sh -c "$(curl -fsSL URL)"` 兼容。
-# 发布前只需要将 YOUR_GITHUB_USERNAME 修改为真实的 GitHub 用户名。
+# 默认使用 fengqi0216/xray-deploy，支持环境变量临时覆盖仓库。
 # 可通过环境变量 XSS_GITHUB_OWNER / XSS_GITHUB_REPO / XSS_GITHUB_REF 临时覆盖。
 set -eu
 
-GITHUB_OWNER="${XSS_GITHUB_OWNER:-YOUR_GITHUB_USERNAME}"
-GITHUB_REPO="${XSS_GITHUB_REPO:-xray-ss-deploy}"
+GITHUB_OWNER="${XSS_GITHUB_OWNER:-fengqi0216}"
+GITHUB_REPO="${XSS_GITHUB_REPO:-xray-deploy}"
 GITHUB_REF="${XSS_GITHUB_REF:-main}"
 
 say() { printf '%s\n' "$*"; }
 error() { printf '[错误] %s\n' "$*" >&2; exit 1; }
 
 case "$GITHUB_OWNER" in
-  ''|YOUR_GITHUB_USERNAME) error '发布者尚未填写 GitHub 用户名。请先编辑 install-xray-ss.sh 的 GITHUB_OWNER。' ;;
+  '') error '未填写 GitHub 用户名。' ;;
   *[!a-zA-Z0-9-]*) error 'GitHub 用户名包含非法字符。' ;;
 esac
 case "$GITHUB_REPO" in
@@ -55,7 +55,7 @@ grep -Fq 'SCRIPT_DIR=' "$tmp/install.sh" || error 'install.sh 内容不符合预
 grep -Fq '# Xray SS Manager:' "$tmp/xray-ss.sh" || error 'xray-ss.sh 内容不符合预期，已停止执行。'
 chmod 700 "$tmp/install.sh" "$tmp/xray-ss.sh"
 
-say '[+] 下载成功，正在启动 Xray SS / SS2022 中文管理系统。'
+say '[+] 下载成功，正在启动 Xray 中文管理系统（当前支持 SS / SS2022）。'
 if [ "$(id -u)" -eq 0 ]; then
   sh "$tmp/install.sh" "$@"
 elif command -v sudo >/dev/null 2>&1; then
