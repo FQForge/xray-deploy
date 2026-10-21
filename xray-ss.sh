@@ -1865,6 +1865,10 @@ make_reality_probe_config() {
     '0.0.0.0'|'*') address='127.0.0.1' ;;
   esac
   port="$(jq -er .port <<< "$node")" || return 1
+  if [[ -n "${3:-}" ]]; then
+    address='127.0.0.1'
+    port="$(normalize_port "$3")" || return 1
+  fi
   jq -n --argjson outbound "$outbound" --arg address "$address" --argjson port "$port" --argjson proxy_port "$proxy_port" '
     {log:{loglevel:"debug"},
      inbounds:[{tag:"reality-probe-in",listen:"127.0.0.1",port:$proxy_port,protocol:"socks",
@@ -1873,10 +1877,24 @@ make_reality_probe_config() {
        .settings.vnext[0].address=$address | .settings.vnext[0].port=$port)]}'
 }
 
+# 对照实例沿用原节点、路由和出站，只调整本机监听与诊断日志。
+# 日志写入私有临时目录，避免原配置中的日志路径造成权限错误或混淆结果。
+make_reality_probe_server_config() {
+  local tag="$1" port
+  port="$(normalize_port "$2")" || return 1
+  jq -e --arg t "$tag" --argjson port "$port" '
+    [.inbounds[] | select(.tag==$t and .protocol=="vless" and .streamSettings.security=="reality")] as $nodes |
+    select($nodes|length==1) |
+    .log={loglevel:"debug"} |
+    .inbounds=[($nodes[0] | .listen="127.0.0.1" | .port=$port | .streamSettings.realitySettings.show=true)]' "$CONFIG"
+}
+
 # 只显示失败相关日志，先隐藏当前配置中的凭据，再隐藏日志里可能来自旧配置的凭据。
 print_reality_probe_errors() {
   local probe_dir="$1" since="$2" kind heading lines
-  if [[ "$INIT_SYSTEM" == systemd ]] && command -v journalctl >/dev/null 2>&1; then
+  if [[ -f "$probe_dir/server.json" ]]; then
+    : # 临时实例的日志已经写入 server.log，不能被其他实例的日志覆盖。
+  elif [[ "$INIT_SYSTEM" == systemd ]] && command -v journalctl >/dev/null 2>&1; then
     journalctl -u "$SERVICE" --since "@$since" -n 40 --no-pager -o cat > "$probe_dir/server.log" 2>/dev/null || true
   elif [[ -r "$LOG_FILE" ]]; then
     tail -n 40 "$LOG_FILE" > "$probe_dir/server.log" 2>/dev/null || true
@@ -1893,7 +1911,9 @@ print_reality_probe_errors() {
     case "$kind" in
       curl) heading='HTTPS 请求错误' ;;
       client) heading='自检客户端错误' ;;
-      server) heading='服务端最近错误' ;;
+      server)
+        if [[ -f "$probe_dir/server.json" ]]; then heading='临时服务端握手错误'
+        else heading='服务端最近错误'; fi ;;
       check) heading='自检配置校验错误' ;;
     esac
     if ! lines="$(jq -Rr --slurpfile secrets "$probe_dir/redactions.json" '
@@ -1902,6 +1922,7 @@ print_reality_probe_errors() {
         reduce $secrets[0][] as $secret (.; split($secret) | join("[已隐藏]")) |
         gsub("(?i)(vless|vmess|ss|trojan)://[^[:space:]]+"; "[分享链接已隐藏]") |
         gsub("[a-fA-F0-9]{8}-([a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}"; "[UUID已隐藏]") |
+        gsub("\\[(0x[0-9a-fA-F]+|[0-9a-fA-F]{1,3})([ ,]+(0x[0-9a-fA-F]+|[0-9a-fA-F]{1,3}))+\\]"; "[字节值已隐藏]") |
         gsub("[A-Za-z0-9_+/-]{43,}={0,2}"; "[长串已隐藏]") |
         gsub("[a-fA-F0-9]{16,}"; "[十六进制值已隐藏]")
       ' "$probe_dir/$kind.log" 2>/dev/null | tail -n 6)"; then
@@ -1913,15 +1934,36 @@ print_reality_probe_errors() {
   done
 }
 
+# 只等待当前临时进程的监听；进程退出时立即结束等待。
+wait_reality_probe_ready() {
+  local pid="$1" port="$2" tries
+  for ((tries=0; tries<30; tries++)); do
+    kill -0 "$pid" 2>/dev/null || return 1
+    if tcp_port_is_listening "$port"; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
 # 临时启动一个仅监听本机的客户端，让 HTTPS 请求实际通过 Reality + Vision。
 # 配置和日志只存放在私有临时目录，结束时停止客户端并删除临时凭据。
 probe_reality_connection() (
-  local tag="$1" proxy_port probe_dir probe_pid='' ready=0 tries sni tls_result curl_status started
+  local tag="$1" mode="${2:-service}" proxy_port probe_dir probe_pid='' server_pid='' server_port='' tries sni tls_result curl_status started
   proxy_port="$(choose_port auto)" || { fail '无法为 Reality 自检找到空闲本机端口。'; return 1; }
   probe_dir="$(mktemp -d)" || { fail '无法创建 Reality 自检临时目录。'; return 1; }
-  trap 'if [[ -n "${probe_pid:-}" ]]; then kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; fi; rm -rf "$probe_dir"' EXIT
+  trap 'for pid in "${probe_pid:-}" "${server_pid:-}"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done; for pid in "${probe_pid:-}" "${server_pid:-}"; do [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true; done; rm -rf "$probe_dir"' EXIT
   trap 'exit 1' HUP INT TERM
-  if ! make_reality_probe_config "$tag" "$proxy_port" > "$probe_dir/client.json"; then
+  if [[ "$mode" == isolated ]]; then
+    for ((tries=0; tries<10; tries++)); do
+      server_port="$(choose_port auto)" || return 1
+      [[ "$server_port" == "$proxy_port" ]] || break
+    done
+    [[ "$server_port" != "$proxy_port" ]] || { fail '无法为临时 Reality 服务端找到独立空闲端口。'; return 1; }
+    if ! make_reality_probe_server_config "$tag" "$server_port" > "$probe_dir/server.json"; then
+      fail '无法生成临时 Reality 服务端配置。'; return 1
+    fi
+  fi
+  if ! make_reality_probe_config "$tag" "$proxy_port" "$server_port" > "$probe_dir/client.json"; then
     fail '无法生成 Reality 自检客户端配置。'; return 1
   fi
   sni="$(jq -er '.outbounds[0].streamSettings.realitySettings.serverName' "$probe_dir/client.json")" || return 1
@@ -1931,17 +1973,21 @@ probe_reality_connection() (
     warn '当前内核不接受导出的 Reality 客户端配置。'
     print_reality_probe_errors "$probe_dir" "$started"; return 1
   fi
-  "$CORE_LINK" run -format json -config "$probe_dir/client.json" > "$probe_dir/client.log" 2>&1 &
-  probe_pid=$!
-  for ((tries=0; tries<30; tries++)); do
-    if ! kill -0 "$probe_pid" 2>/dev/null; then
-      warn 'Reality 自检客户端启动失败。'
+  if [[ "$mode" == isolated ]]; then
+    if ! "$CORE_LINK" run -test -format json -config "$probe_dir/server.json" >> "$probe_dir/check.log" 2>&1; then
+      warn '当前内核不接受临时 Reality 服务端配置。'
       print_reality_probe_errors "$probe_dir" "$started"; return 1
     fi
-    if tcp_port_is_listening "$proxy_port"; then ready=1; break; fi
-    sleep 0.1
-  done
-  if ((!ready)); then
+    "$CORE_LINK" run -format json -config "$probe_dir/server.json" > "$probe_dir/server.log" 2>&1 &
+    server_pid=$!
+    if ! wait_reality_probe_ready "$server_pid" "$server_port"; then
+      warn '临时 Reality 服务端未能建立本机监听。'
+      print_reality_probe_errors "$probe_dir" "$started"; return 1
+    fi
+  fi
+  "$CORE_LINK" run -format json -config "$probe_dir/client.json" > "$probe_dir/client.log" 2>&1 &
+  probe_pid=$!
+  if ! wait_reality_probe_ready "$probe_pid" "$proxy_port"; then
     warn 'Reality 自检客户端未能建立本机代理监听。'
     print_reality_probe_errors "$probe_dir" "$started"; return 1
   fi
@@ -2018,7 +2064,15 @@ diagnose_reality_nodes() {
       info '正在通过本机 Reality + Vision 节点发起 HTTPS 请求……'
       if probe_reality_connection "$tag"; then
         info '本机 Reality 握手和代理请求通过。若客户端仍失败，请检查公网 TCP 入口及客户端配置。'
-      else failed=1; fi
+      else
+        failed=1
+        info '正在使用相同节点配置启动临时实例，检查服务端握手错误……'
+        if probe_reality_connection "$tag" isolated; then
+          warn '当前配置在临时实例中通过，但现有服务连接失败。请在服务管理中重启服务后重新诊断，并检查服务加载的配置和监听进程。'
+        else
+          warn '临时实例也未通过，请保留上面的临时服务端握手错误；仅凭 EOF 还不能区分伪装站点兼容性与内核握手问题。'
+        fi
+      fi
     fi
     say "  公网入站需要从客户端验证：确认 TCP $public_port 已放行；NAT 需转发到本机 $port。"
   done
