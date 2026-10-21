@@ -29,6 +29,8 @@ MANUAL_UNIT_FILE="${XSS_MANUAL_UNIT_FILE:-$OPT_DIR/standalone-service.sh}"
 GITHUB_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 # 默认安装目标版本；保留手动输入/选择其他版本的能力。
 DEFAULT_XRAY_VERSION='v26.6.1'
+# 一键创建优先兼容常见客户端；SS2022 仍可在自定义创建中选择。
+DEFAULT_SS_METHOD='aes-256-gcm'
 DISTRO_ID=unknown
 DISTRO_NAME=unknown
 DISTRO_ID_LIKE=''
@@ -41,7 +43,28 @@ info() { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 fail() { warn "$*"; return 1; }
 require_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || fail '请使用 root 用户或 sudo 运行此脚本。'; }
-need_core() { [[ -x "$CORE_LINK" ]] || fail '尚未安装 Xray 内核，请先在菜单中选择 1 安装。'; }
+need_core() { [[ -x "$CORE_LINK" ]] || fail '尚未安装 Xray 内核。主菜单选择 1 可自动安装并创建节点，或到高级设置中安装指定版本。'; }
+
+# 仅在彩色终端中使用 ANSI，重定向、TERM=dumb 和 NO_COLOR 下保持纯文本。
+ui_text() {
+  local style="$1" text="$2"
+  if [[ -t 1 && "${TERM:-dumb}" != dumb && -z "${NO_COLOR+x}" ]]; then
+    printf '\033[%sm%s\033[0m\n' "$style" "$text"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+
+ui_title() {
+  say ''
+  ui_text '36' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  ui_text '1;36' "  $1"
+  ui_text '36' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+}
+
+ui_section() { say ''; ui_text '1;36' "  $1"; }
+ui_item() { printf '  %s）%s\n' "$1" "$2"; }
+ui_back() { say ''; ui_item 0 "${1:-返回上级菜单}"; say ''; }
 
 detect_distribution() {
   if [[ -r /etc/os-release ]]; then
@@ -644,7 +667,9 @@ port_in_use() {
 
 choose_port() {
   local proposed='' tries=0
-  read -r -p '请输入节点端口（直接回车随机生成 10000～60000）：' proposed
+  if [[ "${1:-}" != auto ]]; then
+    read -r -p '请输入节点端口（直接回车自动选择空闲端口）：' proposed || return 1
+  fi
   if [[ -z "$proposed" ]]; then
     while ((tries < 50)); do
       local random_hex random_num
@@ -668,7 +693,9 @@ choose_method() {
   )
   local n sel
   for ((n=0;n<${#methods[@]};n++)); do printf '%d） %s\n' "$((n+1))" "${methods[n]}" >&2; done
-  read -r -p '请选择加密方式（1～7）：' sel
+  say '直接回车使用 2（aes-256-gcm，兼容常见客户端）；5～7 需要客户端支持 SS2022。' >&2
+  read -r -p '请选择加密方式 [1～7，默认 2]：' sel || return 1
+  sel="${sel:-2}"
   [[ "$sel" =~ ^[1-7]$ ]] || { fail '请输入 1～7 的序号。'; return 1; }
   printf '%s\n' "${methods[sel-1]}"
 }
@@ -718,15 +745,11 @@ resolve_node_tag() {
   fail '未找到指定节点。'
 }
 
-# 首次从添加节点入口进入时，询问是否安装默认内核；菜单 1 仍可自由选版本。
+# 用户选择创建节点即自动准备缺失的内核；已安装时保留当前版本。
 ensure_core_for_new_node() {
   [[ -x "$CORE_LINK" ]] && return 0
-  local answer
-  read -r -p "Xray 尚未安装。是否安装默认版本 $DEFAULT_XRAY_VERSION？[Y/n]：" answer || return 1
-  case "$answer" in
-    ''|y|Y|yes|YES|是) switch_version "$DEFAULT_XRAY_VERSION" ;;
-    *) fail '已取消默认安装。可选择菜单 1 手动安装其他版本。' ;;
-  esac
+  info "首次创建：正在自动安装 Xray $DEFAULT_XRAY_VERSION。"
+  switch_version "$DEFAULT_XRAY_VERSION"
 }
 
 apply_config() {
@@ -759,20 +782,46 @@ apply_config() {
   info '配置校验通过，Xray 服务已运行。'
 }
 
+next_node_name() {
+  local n=1
+  while resolve_node_tag "ss-节点$n" >/dev/null 2>&1; do ((n+=1)); done
+  printf '节点%s\n' "$n"
+}
+
 add_node() {
-  ensure_core_for_new_node || return 1
   init_config
-  local name tag method port network pass node tmp host
-  read -r -p '请输入节点名称（支持中文、英文及常见符号，最多 48 个字符）：' name
+  local name method port host default_name
+  ui_title '自定义创建节点'
+  default_name="$(next_node_name)" || return 1
+  read -r -p "节点名称（支持中文，直接回车使用 $default_name）：" name || return 1
+  name="${name:-$default_name}"
   safe_name "$name" || { fail '节点名称无效：需为 1～48 个字符，不能包含控制字符、斜杠或首尾空格。'; return 1; }
-  tag="ss-$name"
-  if jq -e --arg tag "$tag" --arg legacy "xss-$name" '.inbounds[]? | select(.tag==$tag or .tag==$legacy)' "$CONFIG" >/dev/null; then
+  if resolve_node_tag "ss-$name" >/dev/null 2>&1; then
     fail '该节点名称已存在（含旧版节点），请使用不同的名称。'; return 1
   fi
   method="$(choose_method)" || return 1
   port="$(choose_port)" || return 1
   host="$(choose_node_host)" || return 1
-  network="tcp,udp"
+  ensure_core_for_new_node || return 1
+  create_node "$name" "$method" "$port" "$host"
+}
+
+quick_add_node() {
+  init_config
+  ui_title '一键创建节点'
+  info "自动命名、空闲端口、随机密码、公网 IP；使用 SS（$DEFAULT_SS_METHOD）。"
+  local name port host
+  name="$(next_node_name)" || return 1
+  port="$(choose_port auto)" || return 1
+  host="$(choose_node_host auto)" || return 1
+  ensure_core_for_new_node || return 1
+  create_node "$name" "$DEFAULT_SS_METHOD" "$port" "$host"
+}
+
+# 两种创建入口共用配置校验、地址保存和服务启动流程。
+create_node() {
+  local name="$1" method="$2" port="$3" host="$4"
+  local tag="ss-$name" network='tcp,udp' pass node tmp
 
   # 每次仅创建一个带独立密码的节点；不再询问单用户/多用户模式。
   pass="$(new_password "$method")" || return 1
@@ -788,36 +837,62 @@ add_node() {
     return 1
   fi
   info "已创建节点：$tag，端口 $port，加密方式 $method。"
-  warn "请在 VPS 服务商安全组和服务器防火墙中放行端口 $port（$network）。"
+  warn "请在 VPS 服务商安全组和服务器防火墙中放行端口 $port（TCP + UDP）。"
 
   # 服务成功启动后立即显示该节点连接信息，而不是所有节点。
   if ! show_node_connection "$tag"; then
-    warn '节点已创建且服务已启动，但显示连接信息失败。可在菜单 4 中重新查看。'
+    warn '节点已创建且服务已启动，但显示连接信息失败。可在主菜单 2 中重新查看。'
   fi
+  say '下一步：复制上面的 ss:// 链接，在客户端选择“从剪贴板导入”。'
 }
 
 list_nodes() {
   [[ -f "$CONFIG" ]] || { say '尚未创建配置文件。'; return 0; }
   local rows
-  rows="$(jq -r '.inbounds[]? | [(.tag | if startswith("xss-") then "ss-" + .[4:] else . end), (.port|tostring), (.settings.method // (.settings.users[0].method // "未知")), (.settings.network // "tcp")] | @tsv' "$CONFIG")" || return 1
-  [[ -n "$rows" ]] || { say '当前没有任何节点。'; return 0; }
+  rows="$(jq -r '.inbounds | to_entries[] | .key as $i | .value | [($i+1|tostring), (.tag | if startswith("xss-") then "ss-" + .[4:] else . end), (.port|tostring), (.settings.method // (.settings.users[0].method // "未知")), (.settings.network // "tcp")] | @tsv' "$CONFIG")" || return 1
+  [[ -n "$rows" ]] || { say '当前没有任何节点。主菜单选择 1 即可一键创建。'; return 0; }
   {
-    printf '节点名称\t端口\t加密方式\t传输方式\n'
+    printf '序号\t节点名称\t端口\t加密方式\t传输方式\n'
     printf '%s\n' "$rows"
   } | { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
 }
 
 choose_node() {
-  list_nodes >&2
-  local name
-  read -r -p '请输入节点名称（例如 北京节点 或 ss-北京节点）：' name || return 1
-  resolve_node_tag "$name"
+  local input tag n
+  local -a tags=()
+  [[ -f "$CONFIG" ]] || { say '当前没有任何节点。主菜单选择 1 即可一键创建。' >&2; return 2; }
+  while IFS= read -r tag; do tags+=("$tag"); done < <(jq -r '.inbounds[]?.tag' "$CONFIG")
+  ((${#tags[@]})) || { say '当前没有任何节点。主菜单选择 1 即可一键创建。' >&2; return 2; }
+  if [[ "${1:-}" == auto && ${#tags[@]} -eq 1 ]]; then
+    info "已自动选中唯一节点：$(visible_node_name "${tags[0]}")" >&2
+    printf '%s\n' "${tags[0]}"
+    return 0
+  fi
+  list_nodes >&2 || return 1
+  while :; do
+    if ((${#tags[@]} == 1)); then
+      read -r -p '输入节点序号或名称（回车选中唯一节点，0 返回）：' input || return 2
+      input="${input:-1}"
+    else
+      read -r -p '输入节点序号或名称（0 或直接回车返回）：' input || return 2
+      [[ -n "$input" ]] || return 2
+    fi
+    [[ "$input" != 0 ]] || return 2
+    for ((n=0; n<${#tags[@]}; n++)); do
+      if [[ "$input" == "$((n+1))" ]]; then
+        printf '%s\n' "${tags[n]}"
+        return 0
+      fi
+    done
+    if tag="$(resolve_node_tag "$input" 2>/dev/null)"; then printf '%s\n' "$tag"; return 0; fi
+    warn '未找到该节点，请输入列表中的序号或名称。'
+  done
 }
 
 change_port() {
-  need_core
-  local tag port tmp
-  tag="$(choose_node)" || return 1
+  need_core || return 1
+  local tag="${1:-}" port tmp
+  if [[ -z "$tag" ]]; then tag="$(choose_node)" || return 1; fi
   port="$(choose_port)" || return 1
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")"
   jq --arg t "$tag" --argjson p "$port" '(.inbounds[] | select(.tag==$t) | .port)=$p' "$CONFIG" > "$tmp"
@@ -825,15 +900,16 @@ change_port() {
 }
 
 delete_node() {
-  need_core
-  local tag tmp yes
-  tag="$(choose_node)" || return 1
-  read -r -p "将删除节点 $tag，请输入“确认删除”以继续：" yes
-  [[ "$yes" == "确认删除" ]] || return 0
+  need_core || return 1
+  local tag="${1:-}" tmp yes
+  if [[ -z "$tag" ]]; then tag="$(choose_node)" || return 1; fi
+  read -r -p "将删除节点 $(visible_node_name "$tag")，请输入“确认删除”以继续：" yes || return 2
+  [[ "$yes" == "确认删除" ]] || { info '已取消删除。'; return 2; }
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")"
   jq --arg t "$tag" '.inbounds |= map(select(.tag!=$t))' "$CONFIG" > "$tmp"
   if apply_config "$tmp"; then
     remove_node_host "$tag" || warn '节点已删除，但独立连接地址记录清理失败。'
+    info "已删除节点：$(visible_node_name "$tag")。"
   else
     return 1
   fi
@@ -916,8 +992,10 @@ detect_public_host() {
 }
 
 choose_node_host() {
-  local answer host
-  read -r -p '此节点是否使用域名（含 DDNS）作为连接地址？[y/N]：' answer || return 1
+  local answer='' host
+  if [[ "${1:-}" != auto ]]; then
+    read -r -p '此节点是否使用域名（含 DDNS）作为连接地址？[y/N]：' answer || return 1
+  fi
   case "$answer" in
     y|Y|yes|YES|是)
       read -r -p '请输入已解析到此 VPS 的域名（如 ss.example.com）：' host || return 1
@@ -1093,6 +1171,12 @@ show_node_outbound_json() {
 
 show_links() {
   [[ -f "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
+  if ! jq -e '.inbounds | length>0' "$CONFIG" >/dev/null; then
+    say '当前没有任何节点。主菜单选择 1 即可一键创建。'
+    return 0
+  fi
+  ui_title '节点分享链接'
+  say '复制 ss:// 开头的完整一行，在客户端选择“从剪贴板导入”。'
   local host tag display port method password nickname
   while IFS=$'\t' read -r tag port method password nickname; do
     [[ -n "$tag" ]] || continue
@@ -1110,18 +1194,19 @@ show_links() {
 }
 
 view_node_connections() {
-  list_nodes || return 1
-  [[ -f "$CONFIG" ]] && jq -e '.inbounds | length>0' "$CONFIG" >/dev/null || return 0
-  local node_name tag choice
-  read -r -p '请输入要查看的节点名称（直接回车返回）：' node_name || return 0
-  [[ -n "$node_name" ]] || return 0
-  tag="$(resolve_node_tag "$node_name")" || return 1
+  local tag choice selection_status
+  if tag="$(choose_node auto)"; then :
+  else
+    selection_status=$?
+    [[ "$selection_status" == 2 ]] && return 0
+    return "$selection_status"
+  fi
   while :; do
     say ''
-    say '========== 请选择查看方式 =========='
-    say '1）查看 SS / SS2022 连接链接'
-    say '2）查看 Xray 出站 JSON（用于 3x-ui 手动添加出站）'
-    say '0）返回上级菜单'
+    ui_title "查看节点：$(visible_node_name "$tag")"
+    ui_item 1 '查看 SS / SS2022 连接链接'
+    ui_item 2 '查看 Xray 出站 JSON（用于 3x-ui 手动添加出站）'
+    ui_back
     read -r -p '请输入选项（1/2/0）：' choice || return 0
     case "$choice" in
       1) show_node_connection "$tag"; return $? ;;
@@ -1203,37 +1288,131 @@ uninstall_manager() {
   info '卸载完成，其他独立安装的 Xray 服务未受影响。'
 }
 
-menu() {
+menu_summary() {
+  local version='未安装' state='未运行' count=0
+  if [[ -x "$CORE_LINK" ]]; then
+    version="$("$CORE_LINK" -version 2>/dev/null | awk 'NR==1 {print $2; exit}' || true)"
+    version="${version:-已安装}"
+    if service_is_active; then state='运行中'; fi
+  fi
+  if [[ -f "$CONFIG" ]]; then count="$(jq -r '.inbounds | length' "$CONFIG" 2>/dev/null)" || count='未知'; fi
+  say "  内核：$version  ·  服务：$state  ·  节点：$count"
+}
+
+node_menu() {
+  local tag ans selection_status
+  if tag="$(choose_node auto)"; then :
+  else
+    selection_status=$?
+    [[ "$selection_status" == 2 ]] && return 0
+    return "$selection_status"
+  fi
   while :; do
-    printf '\n========== Xray 节点管理系统（SS / SS2022） ==========\n'
-    say " 1）安装或切换 Xray 内核版本（默认 $DEFAULT_XRAY_VERSION）"
-    say ' 2）添加 SS / SS2022 节点（完成后显示连接信息）'
-    say ' 3）查看已有节点'
-    say ' 4）查看节点连接信息 / 出站 JSON'
-    say ' 5）修改节点端口'
-    say ' 6）删除节点'
-    say ' 7）查看服务运行状态'
-    say ' 8）查看运行日志'
-    say ' 9）重启 Xray 服务'
-    say '10）完全卸载管理脚本及受管服务'
-    say '11）检测 Linux 系统兼容性'
-    say ' 0）退出管理系统'
-    local ans tag
-    read -r -p '请输入菜单序号：' ans || return 0
+    ui_title "管理节点：$(visible_node_name "$tag")"
+    ui_item 1 '查看连接信息 / 复制链接'
+    ui_item 2 '导出 Xray 出站 JSON（用于 3x-ui）'
+    ui_item 3 '修改节点端口'
+    ui_text '31' '  4）删除当前节点'
+    ui_back '返回主菜单'
+    read -r -p '请选择 [1-4 / 0]：' ans || return 0
     case "$ans" in
-      1) tag="$(release_menu)" && switch_version "$tag" || true ;;
-      2) add_node || true ;;
-      3) list_nodes || true ;;
-      4) view_node_connections || true ;;
-      5) change_port || true ;;
-      6) delete_node || true ;;
-      7) status || true ;;
-      8) logs || true ;;
-      9) if service_restart && service_is_active; then info 'Xray 服务已重启。'; else warn 'Xray 服务重启失败，请查看运行日志。'; fi ;;
-      10) if uninstall_manager; then return 0; fi ;;
-      11) check_compatibility || true ;;
+      1) show_node_connection "$tag" || true ;;
+      2) show_node_outbound_json "$tag" || true ;;
+      3) change_port "$tag" || true ;;
+      4) if delete_node "$tag"; then return 0; fi ;;
       0) return 0 ;;
-      *) warn '菜单选项无效，请重新选择。' ;;
+      '') continue ;;
+      *) warn '请输入 1～4，或输入 0 返回。' ;;
+    esac
+  done
+}
+
+restart_xray() {
+  need_core || return 1
+  if service_restart && service_is_active; then info 'Xray 服务已运行。'
+  else fail 'Xray 服务启动失败，请在服务管理中查看运行日志。'; fi
+}
+
+service_menu() {
+  local ans
+  while :; do
+    ui_title '服务管理'
+    menu_summary
+    say ''
+    ui_item 1 '查看服务运行状态'
+    ui_item 2 '重启 / 启动 Xray 服务'
+    ui_item 3 '查看运行日志'
+    ui_back '返回主菜单'
+    read -r -p '请选择 [1-3 / 0]：' ans || return 0
+    case "$ans" in
+      1) status || true ;;
+      2) restart_xray || true ;;
+      3) logs || true ;;
+      0) return 0 ;;
+      '') continue ;;
+      *) warn '请输入 1～3，或输入 0 返回。' ;;
+    esac
+  done
+}
+
+advanced_menu() {
+  local ans tag
+  while :; do
+    ui_title '高级设置'
+    ui_item 1 '自定义创建节点（名称 / 加密 / 端口 / 域名）'
+    ui_item 2 "安装或切换 Xray 内核版本（默认 $DEFAULT_XRAY_VERSION）"
+    ui_item 3 '检测 Linux 系统兼容性'
+    say ''
+    ui_text '31' '  4）完全卸载管理脚本及受管服务'
+    ui_back '返回主菜单'
+    read -r -p '请选择 [1-4 / 0]：' ans || return 0
+    case "$ans" in
+      1) add_node || true ;;
+      2) tag="$(release_menu)" && switch_version "$tag" || true ;;
+      3) check_compatibility || true ;;
+      # 返回专用状态，通知主菜单一并退出，避免卸载后继续操作。
+      4) if uninstall_manager; then return 10; fi ;;
+      0) return 0 ;;
+      '') continue ;;
+      *) warn '请输入 1～4，或输入 0 返回。' ;;
+    esac
+  done
+}
+
+menu() {
+  local ans result
+  while :; do
+    ui_title 'Xray 节点管理系统（SS / SS2022）'
+    menu_summary
+    ui_section '常用操作'
+    ui_text '1;32' '  1）一键创建节点（推荐新手）'
+    ui_item 2 '查看 / 复制分享链接'
+    ui_item 3 '查看已有节点'
+    ui_section '管理与维护'
+    ui_item 4 '管理节点（连接信息 / 出站 JSON / 端口 / 删除）'
+    ui_item 5 '服务管理（状态 / 重启 / 日志）'
+    ui_item 6 '高级设置（自定义创建 / 内核版本 / 检测 / 卸载）'
+    ui_back '退出管理系统'
+    say '  新手：选 1 创建 → 复制 ss:// 链接 → 导入客户端'
+    say '  首次创建自动准备内核；需要指定端口或域名请选 6 → 1。'
+    say ''
+    read -r -p '请选择 [1-6 / 0]：' ans || return 0
+    case "$ans" in
+      1) quick_add_node || true ;;
+      2) show_links || true ;;
+      3) list_nodes || true ;;
+      4) node_menu || true ;;
+      5) service_menu ;;
+      6)
+        if advanced_menu; then :
+        else
+          result=$?
+          [[ "$result" != 10 ]] || return 0
+        fi
+        ;;
+      0) return 0 ;;
+      '') continue ;;
+      *) warn '请输入 1～6，或输入 0 退出。' ;;
     esac
   done
 }
@@ -1243,6 +1422,8 @@ usage() {
 Xray 中文节点管理系统（SS / SS2022，v0.10.1）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
+      sudo xnode add           # 一键创建节点并显示分享链接
+      sudo xnode custom        # 自定义名称、加密方式、端口及域名
       sudo xnode links         # 查看所有节点分享链接
       sudo xnode list          # 查看已有节点
       sudo xnode show          # 选择节点，查看分享链接或出站 JSON
@@ -1288,12 +1469,11 @@ main() {
   esac
   require_root
   need_env
-  if [[ -z "${1:-}" ]]; then
-    info "检测到系统：$DISTRO_NAME；服务管理方式：$INIT_SYSTEM；软件包管理器：${PKG_MANAGER:-未识别}"
-  fi
   init_config
   case "${1:-}" in
     links) show_links ;;
+    add) quick_add_node ;;
+    custom) add_node ;;
     show) view_node_connections ;;
     list) list_nodes ;;
     status) status ;;
