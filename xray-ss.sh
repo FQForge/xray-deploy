@@ -972,13 +972,38 @@ node_listen_address() {
   fi
 }
 
+# Xray 不同版本使用 Public key、PublicKey、Password 或 Password (PublicKey)。
+# 只按明确的密钥标签读取；Hash32 是哈希，不能用作客户端公钥。
+read_reality_key() {
+  local kind="$1" key
+  key="$(awk -F: -v kind="$kind" '
+    NF >= 2 {
+      label=tolower($1)
+      gsub(/[[:space:]]/, "", label)
+      if ((kind=="private" && label=="privatekey") ||
+          (kind=="public" && (label=="publickey" || label=="password" || label=="password(publickey)"))) {
+        value=substr($0, index($0, ":")+1)
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        print value
+        exit
+      }
+    }
+  ')" || return 1
+  [[ "$key" =~ ^[a-zA-Z0-9_-]{43}$ ]] || return 1
+  printf '%s\n' "$key"
+}
+
 create_reality_node() {
   local name="$1" port="$2" host="$3" meta="$4" sni="$5"
   local tag="vless-$name" keys private public uuid sid node listen
-  keys="$("$CORE_LINK" x25519)" || { fail '生成 Reality 密钥失败，请检查内核版本。'; return 1; }
-  private="$(awk -F: '{k=$1;gsub(/[[:space:]]/,"",k);if(tolower(k)=="privatekey"){sub(/^[^:]*:[[:space:]]*/,"");gsub(/\r/,"");print;exit}}' <<< "$keys")"
-  public="$(awk -F: '{k=$1;gsub(/[[:space:]]/,"",k);if(tolower(k)=="publickey" || tolower(k)=="password"){sub(/^[^:]*:[[:space:]]*/,"");gsub(/\r/,"");print;exit}}' <<< "$keys")"
-  [[ "$private" =~ ^[a-zA-Z0-9_-]{43}$ && "$public" =~ ^[a-zA-Z0-9_-]{43}$ ]] || { fail '无法读取 Reality 密钥，请安装支持 Reality 的 Xray 内核后重试。'; return 1; }
+  # 同时捕获两个输出通道，失败时也不将可能含私钥的原始输出显示到终端。
+  keys="$("$CORE_LINK" x25519 2>&1)" || { fail 'Xray 密钥命令执行失败，请在高级设置中检查或切换内核版本。'; return 1; }
+  if ! private="$(read_reality_key private <<< "$keys")" ||
+     ! public="$(read_reality_key public <<< "$keys")"; then
+    fail '无法解析 Xray 返回的 Reality 密钥。请更新管理脚本；仍失败时，请提供内核版本和输出字段名称，不要提供密钥内容。'
+    return 1
+  fi
   uuid="$("$CORE_LINK" uuid)" || return 1
   [[ "$uuid" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || { fail '内核未生成有效 UUID。'; return 1; }
   sid="$(openssl rand -hex 8)" || return 1
@@ -1560,8 +1585,11 @@ node_reality_public_key() {
   fi
   if [[ -z "$key" ]]; then
     private="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.streamSettings.realitySettings.privateKey' "$CONFIG")" || return 1
-    output="$("$CORE_LINK" x25519 -i "$private")" || return 1
-    key="$(awk -F: '{k=$1;gsub(/[[:space:]]/,"",k);if(tolower(k)=="publickey" || tolower(k)=="password"){sub(/^[^:]*:[[:space:]]*/,"");gsub(/\r/,"");print;exit}}' <<< "$output")"
+    if ! output="$("$CORE_LINK" x25519 -i "$private" 2>&1)" ||
+       ! key="$(read_reality_key public <<< "$output")"; then
+      fail '无法读取此节点的 Reality 公钥，请检查内核版本和密钥输出格式，不要提供私钥内容。'
+      return 1
+    fi
   fi
   [[ "$key" =~ ^[a-zA-Z0-9_-]{43}$ ]] || { fail '无法读取此节点的 Reality 公钥。'; return 1; }
   printf '%s\n' "$key"
