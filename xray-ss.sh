@@ -1866,17 +1866,57 @@ make_reality_probe_config() {
   esac
   port="$(jq -er .port <<< "$node")" || return 1
   jq -n --argjson outbound "$outbound" --arg address "$address" --argjson port "$port" --argjson proxy_port "$proxy_port" '
-    {log:{loglevel:"warning"},
+    {log:{loglevel:"debug"},
      inbounds:[{tag:"reality-probe-in",listen:"127.0.0.1",port:$proxy_port,protocol:"socks",
        settings:{auth:"noauth",udp:false}}],
      outbounds:[($outbound | .tag="reality-probe-out" | .mux={enabled:false} |
        .settings.vnext[0].address=$address | .settings.vnext[0].port=$port)]}'
 }
 
+# 只显示失败相关日志，先隐藏当前配置中的凭据，再隐藏日志里可能来自旧配置的凭据。
+print_reality_probe_errors() {
+  local probe_dir="$1" since="$2" kind heading lines
+  if [[ "$INIT_SYSTEM" == systemd ]] && command -v journalctl >/dev/null 2>&1; then
+    journalctl -u "$SERVICE" --since "@$since" -n 40 --no-pager -o cat > "$probe_dir/server.log" 2>/dev/null || true
+  elif [[ -r "$LOG_FILE" ]]; then
+    tail -n 40 "$LOG_FILE" > "$probe_dir/server.log" 2>/dev/null || true
+  fi
+  if ! jq -n --slurpfile server "$CONFIG" --slurpfile client "$probe_dir/client.json" '
+      [$server[], $client[]] |
+      [.. | objects | (.id?, .password?, .privateKey?, .publicKey?, .shortId?, .shortIds[]?, .reality_public_key?)] |
+      map(select(type=="string" and length>0)) | unique' > "$probe_dir/redactions.json" 2>/dev/null; then
+    warn '无法安全提取诊断日志，已隐藏原始错误内容。'
+    return 0
+  fi
+  for kind in curl client server check; do
+    [[ -s "$probe_dir/$kind.log" ]] || continue
+    case "$kind" in
+      curl) heading='HTTPS 请求错误' ;;
+      client) heading='自检客户端错误' ;;
+      server) heading='服务端最近错误' ;;
+      check) heading='自检配置校验错误' ;;
+    esac
+    if ! lines="$(jq -Rr --slurpfile secrets "$probe_dir/redactions.json" '
+        gsub("\u001b\\[[0-9;]*[A-Za-z]"; "") |
+        select(test("(?i)(curl:|error|failed|failure|invalid|rejected|refused|reset by peer|timeout|timed out|unreachable|unexpected|handshake|certificate|eof|panic|fatal)")) |
+        reduce $secrets[0][] as $secret (.; split($secret) | join("[已隐藏]")) |
+        gsub("(?i)(vless|vmess|ss|trojan)://[^[:space:]]+"; "[分享链接已隐藏]") |
+        gsub("[a-fA-F0-9]{8}-([a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}"; "[UUID已隐藏]") |
+        gsub("[A-Za-z0-9_+/-]{43,}={0,2}"; "[长串已隐藏]") |
+        gsub("[a-fA-F0-9]{16,}"; "[十六进制值已隐藏]")
+      ' "$probe_dir/$kind.log" 2>/dev/null | tail -n 6)"; then
+      continue
+    fi
+    [[ -n "$lines" ]] || continue
+    say "  $heading（连接凭据已隐藏）："
+    printf '%s\n' "$lines"
+  done
+}
+
 # 临时启动一个仅监听本机的客户端，让 HTTPS 请求实际通过 Reality + Vision。
 # 配置和日志只存放在私有临时目录，结束时停止客户端并删除临时凭据。
 probe_reality_connection() (
-  local tag="$1" proxy_port probe_dir probe_pid='' ready=0 tries sni tls_result curl_status
+  local tag="$1" proxy_port probe_dir probe_pid='' ready=0 tries sni tls_result curl_status started
   proxy_port="$(choose_port auto)" || { fail '无法为 Reality 自检找到空闲本机端口。'; return 1; }
   probe_dir="$(mktemp -d)" || { fail '无法创建 Reality 自检临时目录。'; return 1; }
   trap 'if [[ -n "${probe_pid:-}" ]]; then kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; fi; rm -rf "$probe_dir"' EXIT
@@ -1886,22 +1926,28 @@ probe_reality_connection() (
   fi
   sni="$(jq -er '.outbounds[0].streamSettings.realitySettings.serverName' "$probe_dir/client.json")" || return 1
   valid_domain "$sni" || { fail 'Reality 自检的伪装域名无效。'; return 1; }
+  started="$(date +%s)"
   if ! "$CORE_LINK" run -test -format json -config "$probe_dir/client.json" > "$probe_dir/check.log" 2>&1; then
-    fail '当前内核不接受导出的 Reality 客户端配置。'; return 1
+    warn '当前内核不接受导出的 Reality 客户端配置。'
+    print_reality_probe_errors "$probe_dir" "$started"; return 1
   fi
   "$CORE_LINK" run -format json -config "$probe_dir/client.json" > "$probe_dir/client.log" 2>&1 &
   probe_pid=$!
   for ((tries=0; tries<30; tries++)); do
     if ! kill -0 "$probe_pid" 2>/dev/null; then
-      fail 'Reality 自检客户端启动失败，请检查本机权限和可用内存。'; return 1
+      warn 'Reality 自检客户端启动失败。'
+      print_reality_probe_errors "$probe_dir" "$started"; return 1
     fi
     if tcp_port_is_listening "$proxy_port"; then ready=1; break; fi
     sleep 0.1
   done
-  if ((!ready)); then fail 'Reality 自检客户端未能建立本机代理监听。'; return 1; fi
+  if ((!ready)); then
+    warn 'Reality 自检客户端未能建立本机代理监听。'
+    print_reality_probe_errors "$probe_dir" "$started"; return 1
+  fi
   if tls_result="$(curl --silent --show-error --noproxy '' --proxy "socks5h://127.0.0.1:$proxy_port" \
     --connect-timeout 5 --max-time 15 --tlsv1.3 --tls-max 1.3 --head --output /dev/null \
-    --write-out '%{ssl_verify_result} %{time_appconnect}' "https://$sni/" 2>/dev/null)"; then
+    --write-out '%{ssl_verify_result} %{time_appconnect}' "https://$sni/" 2> "$probe_dir/curl.log")"; then
     return 0
   else
     curl_status=$?
@@ -1910,7 +1956,9 @@ probe_reality_connection() (
   if awk 'NF==2 && $1=="0" && $2 ~ /^[0-9]+[.][0-9]+$/ && ($2+0)>0 {ok=1} END {exit !ok}' <<< "$tls_result"; then
     return 0
   fi
-  fail "本机 Reality 隧道请求失败（curl 状态 $curl_status）。请查看 Xray 服务日志中的握手或出站错误。"
+  warn "本机 Reality 隧道请求失败（curl 状态 $curl_status）。"
+  print_reality_probe_errors "$probe_dir" "$started"
+  return 1
 )
 
 diagnose_reality_nodes() {
