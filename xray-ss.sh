@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Xray SS Manager: standalone Shadowsocks / Shadowsocks 2022 VPS manager.
+# Xray SS Manager: standalone SS / SS2022 / VLESS + Reality node manager.
 # Supports major Linux distributions and common init systems; see README for scope.
 # This is an independent implementation, not a fork of singbox-deploy.
 set -Eeuo pipefail
@@ -16,6 +16,10 @@ ENTRY="${XSS_ENTRY:-/usr/local/bin/xnode}"
 CONFIG="$ETC_DIR/config.json"
 HOST_FILE="$ETC_DIR/host.txt"    # 旧版全局连接地址：仅用于读取旧节点
 NODE_HOSTS_FILE="$ETC_DIR/node-hosts.json"
+NODE_META_FILE="$ETC_DIR/node-meta.json"
+DDNS_FILE="$ETC_DIR/ddns.json"
+DDNS_SERVICE_FILE="${XSS_DDNS_SERVICE_FILE:-/etc/systemd/system/xnode-ddns.service}"
+DDNS_TIMER_FILE="${XSS_DDNS_TIMER_FILE:-/etc/systemd/system/xnode-ddns.timer}"
 BACKUP_DIR="$ETC_DIR/backups"
 UNIT_FILE="${XSS_UNIT_FILE:-/etc/systemd/system/$SERVICE}"
 OPENRC_UNIT_FILE="${XSS_OPENRC_UNIT_FILE:-/etc/init.d/xray-ss}"
@@ -29,8 +33,10 @@ MANUAL_UNIT_FILE="${XSS_MANUAL_UNIT_FILE:-$OPT_DIR/standalone-service.sh}"
 GITHUB_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 # 默认安装目标版本；保留手动输入/选择其他版本的能力。
 DEFAULT_XRAY_VERSION='v26.6.1'
-# 一键创建优先兼容常见客户端；SS2022 仍可在自定义创建中选择。
+# 三种协议在创建时选择；快速创建使用对应的默认加密和 Reality 参数。
 DEFAULT_SS_METHOD='aes-256-gcm'
+DEFAULT_SS2022_METHOD='2022-blake3-aes-256-gcm'
+DEFAULT_REALITY_SERVER='www.microsoft.com'
 DISTRO_ID=unknown
 DISTRO_NAME=unknown
 DISTRO_ID_LIKE=''
@@ -221,6 +227,10 @@ init_config() {
     printf '{}\n' > "$NODE_HOSTS_FILE"
     chmod 600 "$NODE_HOSTS_FILE"
   fi
+  if [[ ! -f "$NODE_META_FILE" ]]; then
+    printf '{}\n' > "$NODE_META_FILE"
+    chmod 600 "$NODE_META_FILE"
+  fi
   if [[ ! -e "$ENTRY" && ! -L "$ENTRY" ]]; then
     # Install a copy, so this manager remains available after removing the download.
     cp "${BASH_SOURCE[0]}" "$ENTRY"
@@ -258,7 +268,7 @@ install_service_unit() {
         cat > "$UNIT_FILE" <<EOF
 # XSS-MANAGED: xray-ss
 [Unit]
-Description=Xray SS / SS2022 standalone service
+Description=Xray node manager service (SS / SS2022 / Reality)
 After=network-online.target
 Wants=network-online.target
 
@@ -287,7 +297,7 @@ EOF
         cat > "$OPENRC_UNIT_FILE" <<EOF
 #!/sbin/openrc-run
 # XSS-MANAGED: xray-ss
-name="Xray SS / SS2022"
+name="Xray node manager"
 description="Xray Shadowsocks service"
 command="$CORE_LINK"
 command_args="run -config $CONFIG"
@@ -319,7 +329,7 @@ EOF
 # Required-Stop:     \$network \$remote_fs
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
-# Short-Description: Xray SS / SS2022 service
+# Short-Description: Xray SS / SS2022 / Reality service
 ### END INIT INFO
 CORE="$CORE_LINK"
 CONFIG="$CONFIG"
@@ -665,6 +675,14 @@ port_in_use() {
   return 1
 }
 
+normalize_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  value=$((10#$value))
+  ((value >= 1 && value <= 65535)) || return 1
+  printf '%s\n' "$value"
+}
+
 choose_port() {
   local proposed='' tries=0
   if [[ "${1:-}" != auto ]]; then
@@ -681,7 +699,7 @@ choose_port() {
     done
     fail '未找到可用的随机端口，请手动指定。'; return 1
   fi
-  [[ "$proposed" =~ ^[0-9]+$ ]] && ((proposed>=1 && proposed<=65535)) || { fail '端口号无效，请输入 1～65535 之间的数字。'; return 1; }
+  proposed="$(normalize_port "$proposed")" || { fail '端口号无效，请输入 1～65535 之间的数字。'; return 1; }
   port_in_use "$proposed" && { fail "端口 $proposed 已被占用。"; return 1; }
   printf '%s\n' "$proposed"
 }
@@ -691,12 +709,15 @@ choose_method() {
     aes-128-gcm aes-256-gcm chacha20-poly1305 xchacha20-poly1305
     2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305
   )
-  local n sel
+  local n sel default=2
+  case "${1:-}" in
+    ss) methods=(aes-128-gcm aes-256-gcm chacha20-poly1305 xchacha20-poly1305) ;;
+    ss2022) methods=(2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305) ;;
+  esac
   for ((n=0;n<${#methods[@]};n++)); do printf '%d） %s\n' "$((n+1))" "${methods[n]}" >&2; done
-  say '直接回车使用 2（aes-256-gcm，兼容常见客户端）；5～7 需要客户端支持 SS2022。' >&2
-  read -r -p '请选择加密方式 [1～7，默认 2]：' sel || return 1
-  sel="${sel:-2}"
-  [[ "$sel" =~ ^[1-7]$ ]] || { fail '请输入 1～7 的序号。'; return 1; }
+  read -r -p "请选择加密方式 [1～${#methods[@]}，默认 $default]：" sel || return 1
+  sel="${sel:-$default}"
+  [[ "$sel" =~ ^[1-7]$ ]] && ((sel <= ${#methods[@]})) || { fail '请输入列表中的加密方式序号。'; return 1; }
   printf '%s\n' "${methods[sel-1]}"
 }
 
@@ -733,8 +754,9 @@ resolve_node_tag() {
   local -a choices=()
   case "$input" in
     ss-*) choices=("$input" "xss-${input#ss-}") ;;
+    vless-*) choices=("$input") ;;
     xss-*) choices=("$input" "ss-${input#xss-}") ;;
-    *) choices=("$input" "ss-$input" "xss-$input") ;;
+    *) choices=("$input" "ss-$input" "xss-$input" "vless-$input") ;;
   esac
   for tag in "${choices[@]}"; do
     if [[ -f "$CONFIG" ]] && jq -e --arg t "$tag" '.inbounds[]? | select(.tag==$t)' "$CONFIG" >/dev/null; then
@@ -784,75 +806,231 @@ apply_config() {
 
 next_node_name() {
   local n=1
-  while resolve_node_tag "ss-节点$n" >/dev/null 2>&1; do ((n+=1)); done
+  while resolve_node_tag "节点$n" >/dev/null 2>&1; do ((n+=1)); done
   printf '节点%s\n' "$n"
 }
 
 add_node() {
-  init_config
-  local name method port host default_name
+  init_config || return 1
+  local name method='' default_name protocol endpoint sni="$DEFAULT_REALITY_SERVER"
   ui_title '自定义创建节点'
+  protocol="$(choose_protocol)" || return 1
   default_name="$(next_node_name)" || return 1
   read -r -p "节点名称（支持中文，直接回车使用 $default_name）：" name || return 1
   name="${name:-$default_name}"
   safe_name "$name" || { fail '节点名称无效：需为 1～48 个字符，不能包含控制字符、斜杠或首尾空格。'; return 1; }
-  if resolve_node_tag "ss-$name" >/dev/null 2>&1; then
+  if resolve_node_tag "$name" >/dev/null 2>&1; then
     fail '该节点名称已存在（含旧版节点），请使用不同的名称。'; return 1
   fi
-  method="$(choose_method)" || return 1
-  port="$(choose_port)" || return 1
-  host="$(choose_node_host)" || return 1
+  if [[ "$protocol" == vless ]]; then
+    sni="$(choose_reality_server)" || return 1
+  else
+    method="$(choose_method "$protocol")" || return 1
+  fi
+  endpoint="$(choose_connection_setup custom)" || return 1
   ensure_core_for_new_node || return 1
-  create_node "$name" "$method" "$port" "$host"
+  create_selected_node "$protocol" "$name" "$method" "$endpoint" "$sni"
 }
 
 quick_add_node() {
-  init_config
-  ui_title '一键创建节点'
-  info "自动命名、空闲端口、随机密码、公网 IP；使用 SS（$DEFAULT_SS_METHOD）。"
-  local name port host
+  init_config || return 1
+  ui_title '快速创建节点'
+  local name protocol endpoint method=''
+  protocol="$(choose_protocol)" || return 1
   name="$(next_node_name)" || return 1
-  port="$(choose_port auto)" || return 1
-  host="$(choose_node_host auto)" || return 1
+  endpoint="$(choose_connection_setup auto)" || return 1
+  case "$protocol" in ss) method="$DEFAULT_SS_METHOD" ;; ss2022) method="$DEFAULT_SS2022_METHOD" ;; esac
   ensure_core_for_new_node || return 1
-  create_node "$name" "$DEFAULT_SS_METHOD" "$port" "$host"
+  create_selected_node "$protocol" "$name" "$method" "$endpoint" "$DEFAULT_REALITY_SERVER"
+}
+
+choose_protocol() {
+  ui_title '选择节点协议' >&2
+  ui_item 1 'SS（兼容常见客户端）' >&2
+  ui_item 2 'SS2022（客户端需支持 Shadowsocks 2022）' >&2
+  ui_item 3 'VLESS + Reality（自动生成 UUID 和密钥）' >&2
+  ui_item 0 '取消创建' >&2
+  local choice
+  while :; do
+    read -r -p '请选择协议 [1-3，回车选 SS，0 返回]：' choice || return 1
+    case "$choice" in
+      1|'') printf 'ss\n'; return 0 ;;
+      2) printf 'ss2022\n'; return 0 ;;
+      3) printf 'vless\n'; return 0 ;;
+      0) return 1 ;;
+      *) warn '请输入 1、2、3 或 0。' ;;
+    esac
+  done
+}
+
+choose_reality_server() {
+  local host
+  say 'Reality 伪装站点需支持 TLS 1.3，并能从服务器访问；它与节点的 DDNS 域名是两个地址。' >&2
+  read -r -p "Reality 伪装域名（回车使用 $DEFAULT_REALITY_SERVER）：" host || return 1
+  host="${host:-$DEFAULT_REALITY_SERVER}"
+  valid_domain "$host" || { fail '请输入有效的伪装域名。'; return 1; }
+  printf '%s\n' "$host"
+}
+
+choose_connection_setup() {
+  local style="${1:-auto}" current_port="${2:-}" choice host port public_port='' nat=false dynamic=false input default_port
+  ui_title '服务器的网络环境' >&2
+  ui_item 1 '独立公网 / 固定 IP（普通 VPS，默认）' >&2
+  ui_item 2 'NAT / 端口映射（服务商分配端口、家用路由器）' >&2
+  ui_item 3 '动态公网 IP + DDNS 域名' >&2
+  ui_item 4 'NAT + 动态 IP + DDNS 域名' >&2
+  ui_item 0 '取消创建' >&2
+  while :; do
+    read -r -p '请选择网络环境 [1-4，默认 1，0 返回]：' choice || return 1
+    case "$choice" in
+      ''|1) break ;;
+      2) nat=true; break ;;
+      3) dynamic=true; break ;;
+      4) nat=true; dynamic=true; break ;;
+      0) return 1 ;;
+      *) warn '请输入 1～4，或输入 0 返回。' ;;
+    esac
+  done
+  if [[ "$nat" == true ]]; then
+    say '先查看服务商 NAT 面板或路由器的端口转发：公网访问端口 → 本机监听端口。' >&2
+    say '只有出站网络、未分配入站端口的 NAT 无法直接接入。端口不清楚时请返回查看，不能随机猜测。' >&2
+    while :; do
+      read -r -p '公网访问端口（服务商/路由器分配的端口，0 返回）：' input || return 1
+      [[ "$input" != 0 ]] || return 1
+      if public_port="$(normalize_port "$input")"; then break; fi
+      warn '请填写已分配的 1～65535 端口，或输入 0 返回。'
+    done
+    default_port="${current_port:-$public_port}"
+    while :; do
+      read -r -p "对应的本机监听端口（回车使用 $default_port，0 返回）：" input || return 1
+      [[ "$input" != 0 ]] || return 1
+      if port="$(normalize_port "${input:-$default_port}")" && { [[ "$port" == "$current_port" ]] || ! port_in_use "$port"; }; then break; fi
+      warn '本机端口无效或已占用，请按实际映射填写其他空闲端口。'
+    done
+  elif [[ -n "$current_port" ]]; then
+    port="$current_port"
+  elif [[ "$style" == custom ]]; then
+    port="$(choose_port)" || return 1
+  else
+    port="$(choose_port auto)" || return 1
+  fi
+  if [[ "$dynamic" == true ]]; then
+    if [[ "$nat" == true ]]; then
+      say '本机 DDNS 更新要求出口 IP 与入站映射 IP 相同；服务商入口/出口不同，请使用上游设备维护的已有 DDNS。' >&2
+    fi
+    host="$(choose_dynamic_host)" || return 1
+  elif [[ "$nat" == true ]]; then
+    while :; do
+      read -r -p '服务商/路由器的公网 IP 或域名（不是内网 IP，0 返回）：' host || return 1
+      [[ "$host" != 0 ]] || return 1
+      host="${host#[}"; host="${host%]}"
+      if valid_domain "$host" || valid_public_ip "$host"; then break; fi
+      warn '请输入有效的公网 IPv4、IPv6 或域名。'
+    done
+  elif [[ "$style" == custom || "$style" == address ]]; then
+    host="$(choose_node_host)" || return 1
+  else
+    host="$(choose_node_host auto)" || return 1
+  fi
+  jq -n --arg host "$host" --argjson port "$port" --argjson nat "$nat" --argjson dynamic "$dynamic" \
+    --arg public_port "$public_port" '{host:$host,port:$port,nat:$nat,dynamic:$dynamic} +
+    (if $nat then {public_port:($public_port|tonumber)} else {} end)'
+}
+
+create_selected_node() {
+  local protocol="$1" name="$2" method="$3" endpoint="$4" sni="$5" port host
+  port="$(jq -er .port <<< "$endpoint")" || return 1
+  host="$(jq -er .host <<< "$endpoint")" || return 1
+  if [[ "$protocol" == vless ]]; then
+    create_reality_node "$name" "$port" "$host" "$endpoint" "$sni"
+  else
+    create_node "$name" "$method" "$port" "$host" "$endpoint"
+  fi
 }
 
 # 两种创建入口共用配置校验、地址保存和服务启动流程。
 create_node() {
   local name="$1" method="$2" port="$3" host="$4"
-  local tag="ss-$name" network='tcp,udp' pass node tmp
+  local tag="ss-$name" network='tcp,udp' pass node meta="${5:-}" listen
+  listen="$(node_listen_address)"
 
   # 每次仅创建一个带独立密码的节点；不再询问单用户/多用户模式。
   pass="$(new_password "$method")" || return 1
   node="$(jq -n --arg tag "$tag" --argjson port "$port" --arg method "$method" \
-    --arg pass "$pass" --arg network "$network" \
-    '{tag:$tag,listen:"0.0.0.0",port:$port,protocol:"shadowsocks",settings:{method:$method,password:$pass,network:$network}}')" || return 1
+    --arg pass "$pass" --arg network "$network" --arg listen "$listen" \
+    '{tag:$tag,listen:$listen,port:$port,protocol:"shadowsocks",settings:{method:$method,password:$pass,network:$network}}')" || return 1
+  [[ -n "$meta" ]] || meta='{}'
+  commit_new_node "$tag" "$node" "$host" "$meta"
+}
+
+node_listen_address() {
+  # Go 的双栈监听支持 IPv4 和 IPv6；禁用 IPv6 的主机使用 IPv4。
+  if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == 0 ]]; then
+    printf '::\n'
+  else
+    printf '0.0.0.0\n'
+  fi
+}
+
+create_reality_node() {
+  local name="$1" port="$2" host="$3" meta="$4" sni="$5"
+  local tag="vless-$name" keys private public uuid sid node listen
+  keys="$("$CORE_LINK" x25519)" || { fail '生成 Reality 密钥失败，请检查内核版本。'; return 1; }
+  private="$(awk -F: '{k=$1;gsub(/[[:space:]]/,"",k);if(tolower(k)=="privatekey"){sub(/^[^:]*:[[:space:]]*/,"");gsub(/\r/,"");print;exit}}' <<< "$keys")"
+  public="$(awk -F: '{k=$1;gsub(/[[:space:]]/,"",k);if(tolower(k)=="publickey" || tolower(k)=="password"){sub(/^[^:]*:[[:space:]]*/,"");gsub(/\r/,"");print;exit}}' <<< "$keys")"
+  [[ "$private" =~ ^[a-zA-Z0-9_-]{43}$ && "$public" =~ ^[a-zA-Z0-9_-]{43}$ ]] || { fail '无法读取 Reality 密钥，请安装支持 Reality 的 Xray 内核后重试。'; return 1; }
+  uuid="$("$CORE_LINK" uuid)" || return 1
+  [[ "$uuid" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || { fail '内核未生成有效 UUID。'; return 1; }
+  sid="$(openssl rand -hex 8)" || return 1
+  listen="$(node_listen_address)"
+  node="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg private "$private" \
+    --arg sni "$sni" --arg sid "$sid" --arg listen "$listen" '{tag:$tag,listen:$listen,port:$port,protocol:"vless",
+    settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},
+    streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,
+      serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}')" || return 1
+  meta="$(jq --arg key "$public" '.reality_public_key=$key' <<< "$meta")" || return 1
+  commit_new_node "$tag" "$node" "$host" "$meta"
+}
+
+commit_new_node() {
+  local tag="$1" node="$2" host="$3" meta="$4" tmp port public_port traffic
+  if resolve_node_tag "${tag#*-}" >/dev/null 2>&1; then fail '节点名称已存在，请重新创建。'; return 1; fi
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")" || return 1
   jq --argjson node "$node" '.inbounds += [$node]' "$CONFIG" > "$tmp" || { rm -f "$tmp"; return 1; }
-  # 先记录当前节点的独立地址；若配置校验或启动失败则删除该记录。
   if ! save_node_host "$tag" "$host"; then rm -f "$tmp"; return 1; fi
+  if ! save_node_meta "$tag" "$meta"; then remove_node_host "$tag"; rm -f "$tmp"; return 1; fi
   if ! apply_config "$tmp"; then
-    remove_node_host "$tag" || warn '服务创建失败，且独立连接地址记录未能清理。'
+    remove_node_host "$tag" || warn '服务创建失败，节点地址记录未能清理。'
     return 1
   fi
-  info "已创建节点：$tag，端口 $port，加密方式 $method。"
-  warn "请在 VPS 服务商安全组和服务器防火墙中放行端口 $port（TCP + UDP）。"
-
-  # 服务成功启动后立即显示该节点连接信息，而不是所有节点。
-  if ! show_node_connection "$tag"; then
-    warn '节点已创建且服务已启动，但显示连接信息失败。可在主菜单 2 中重新查看。'
+  port="$(jq -r .port <<< "$node")"
+  public_port="$(node_public_port "$tag")" || return 1
+  if [[ "$tag" == vless-* ]]; then traffic='TCP'; else traffic='TCP + UDP'; fi
+  info "已创建节点：$tag。"
+  warn "请在服务器防火墙中放行本机端口 $port（$traffic）。"
+  if jq -e '.nat==true' <<< "$meta" >/dev/null; then
+    say "NAT 映射：公网 $host:$public_port → 本机监听端口 $port（$traffic）。"
+    say '请在服务商面板或路由器确认此映射已启用；脚本只配置本机和连接链接。'
+  else
+    say "请同时在服务商安全组中放行公网端口 $public_port（$traffic）。"
   fi
-  say '下一步：复制上面的 ss:// 链接，在客户端选择“从剪贴板导入”。'
+  if show_node_connection "$tag"; then
+    say '下一步：复制上面的完整链接，在客户端选择“从剪贴板导入”。'
+  else
+    warn '节点已创建，但连接信息显示失败。可在主菜单 2 中重新查看。'
+  fi
 }
 
 list_nodes() {
   [[ -f "$CONFIG" ]] || { say '尚未创建配置文件。'; return 0; }
   local rows
-  rows="$(jq -r '.inbounds | to_entries[] | .key as $i | .value | [($i+1|tostring), (.tag | if startswith("xss-") then "ss-" + .[4:] else . end), (.port|tostring), (.settings.method // (.settings.users[0].method // "未知")), (.settings.network // "tcp")] | @tsv' "$CONFIG")" || return 1
-  [[ -n "$rows" ]] || { say '当前没有任何节点。主菜单选择 1 即可一键创建。'; return 0; }
+  rows="$(jq -r --slurpfile meta "$NODE_META_FILE" '.inbounds | to_entries[] | .key as $i | .value |
+    [($i+1|tostring), (.tag | if startswith("xss-") then "ss-" + .[4:] else . end), (.port|tostring),
+     (($meta[0][.tag].public_port // .port)|tostring),
+     (if .protocol=="vless" then "VLESS+Reality" else (.settings.method // (.settings.users[0].method // "未知")) end)] | @tsv' "$CONFIG")" || return 1
+  [[ -n "$rows" ]] || { say '当前没有任何节点。主菜单选择 1 即可快速创建。'; return 0; }
   {
-    printf '序号\t节点名称\t端口\t加密方式\t传输方式\n'
+    printf '序号\t节点名称\t本机端口\t公网端口\t协议/加密\n'
     printf '%s\n' "$rows"
   } | { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
 }
@@ -860,9 +1038,9 @@ list_nodes() {
 choose_node() {
   local input tag n
   local -a tags=()
-  [[ -f "$CONFIG" ]] || { say '当前没有任何节点。主菜单选择 1 即可一键创建。' >&2; return 2; }
+  [[ -f "$CONFIG" ]] || { say '当前没有任何节点。主菜单选择 1 即可快速创建。' >&2; return 2; }
   while IFS= read -r tag; do tags+=("$tag"); done < <(jq -r '.inbounds[]?.tag' "$CONFIG")
-  ((${#tags[@]})) || { say '当前没有任何节点。主菜单选择 1 即可一键创建。' >&2; return 2; }
+  ((${#tags[@]})) || { say '当前没有任何节点。主菜单选择 1 即可快速创建。' >&2; return 2; }
   if [[ "${1:-}" == auto && ${#tags[@]} -eq 1 ]]; then
     info "已自动选中唯一节点：$(visible_node_name "${tags[0]}")" >&2
     printf '%s\n' "${tags[0]}"
@@ -896,7 +1074,50 @@ change_port() {
   port="$(choose_port)" || return 1
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")"
   jq --arg t "$tag" --argjson p "$port" '(.inbounds[] | select(.tag==$t) | .port)=$p' "$CONFIG" > "$tmp"
-  apply_config "$tmp" && warn "请在服务器防火墙和服务商安全组中放行新端口 $port（按需要放行 TCP/UDP）。"
+  apply_config "$tmp" || return 1
+  warn "请在本机防火墙放行新监听端口 $port。"
+  if jq -e --arg t "$tag" '.[$t].nat==true' "$NODE_META_FILE" >/dev/null; then
+    say "请同步修改服务商/路由器映射：公网端口保持 $(node_public_port "$tag")，转发到新的本机端口 $port。"
+  else
+    say "请在服务商安全组中放行公网端口 $port，并重新复制更新后的链接。"
+  fi
+  show_node_connection "$tag"
+}
+
+restore_node_endpoints() {
+  local hosts="$1" meta="$2" tmp
+  tmp="$(mktemp "$ETC_DIR/.hosts-restore.XXXXXX")" || return 1
+  printf '%s\n' "$hosts" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$NODE_HOSTS_FILE"
+  tmp="$(mktemp "$ETC_DIR/.meta-restore.XXXXXX")" || return 1
+  printf '%s\n' "$meta" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$NODE_META_FILE"
+}
+
+change_node_endpoint() {
+  local tag="$1" endpoint old_port port host old_hosts old_meta meta tmp
+  old_port="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.port' "$CONFIG")" || return 1
+  endpoint="$(choose_connection_setup address "$old_port")" || return 1
+  host="$(jq -er .host <<< "$endpoint")" || return 1
+  port="$(jq -er .port <<< "$endpoint")" || return 1
+  old_hosts="$(cat "$NODE_HOSTS_FILE")" || return 1
+  old_meta="$(cat "$NODE_META_FILE")" || return 1
+  meta="$(jq --arg t "$tag" --argjson endpoint "$endpoint" '(.[$t] // {}) + $endpoint | if .nat then . else del(.public_port) end' "$NODE_META_FILE")" || return 1
+  if ! save_node_host "$tag" "$host" || ! save_node_meta "$tag" "$meta"; then
+    restore_node_endpoints "$old_hosts" "$old_meta"; return 1
+  fi
+  if [[ "$port" != "$old_port" ]]; then
+    tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")" || { restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
+    jq --arg t "$tag" --argjson p "$port" '(.inbounds[]|select(.tag==$t)|.port)=$p' "$CONFIG" > "$tmp" || { rm -f "$tmp"; restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
+    if ! apply_config "$tmp"; then restore_node_endpoints "$old_hosts" "$old_meta"; return 1; fi
+  fi
+  info '节点公网地址和映射信息已更新。'
+  if jq -e .nat <<< "$endpoint" >/dev/null; then
+    say "请确认外部映射：公网 $host:$(node_public_port "$tag") → 本机端口 $port。"
+  fi
+  show_node_connection "$tag"
 }
 
 delete_node() {
@@ -915,7 +1136,7 @@ delete_node() {
   fi
 }
 
-# 地址仅用于生成 ss:// 分享链接，Xray 仍监听所有地址。
+# 公网地址用于生成分享链接；Xray 使用本机监听端口。
 # 新节点的地址按节点标签分别存入 node-hosts.json，互不干扰。
 valid_ipv4() {
   local ip="$1" item
@@ -982,13 +1203,270 @@ valid_domain() {
 
 valid_share_host() { valid_ipv4 "$1" || valid_ipv6 "$1" || valid_domain "$1"; }
 
+valid_public_ip() {
+  local ip="${1,,}" first second
+  if valid_ipv4 "$ip"; then
+    IFS=. read -r first second _ <<< "$ip"
+    first=$((10#$first)); second=$((10#$second))
+    ((first > 0 && first < 224 && first != 10 && first != 127)) || return 1
+    ! ((first==192 && second==168 || first==172 && second>=16 && second<=31 ||
+        first==169 && second==254 || first==100 && second>=64 && second<=127))
+  elif valid_ipv6 "$ip"; then
+    case "$ip" in ::|::1|fc*:*|fd*:*|fe8*:*|fe9*:*|fea*:*|feb*:*|ff*:*) return 1 ;; *) return 0 ;; esac
+  else return 1; fi
+}
+
+# DDNS 凭据只保存在权限为 600 的 JSON 文件中，不作为 shell 代码加载。
+detect_public_ip() {
+  local family="${1:-4}" ip
+  if [[ "$family" == 6 ]]; then
+    ip="$(curl -6fsSL --connect-timeout 4 --max-time 8 https://api6.ipify.org 2>/dev/null)" || return 1
+    valid_ipv6 "$ip" || return 1
+  else
+    ip="$(curl -4fsSL --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null)" || return 1
+    valid_ipv4 "$ip" || return 1
+  fi
+  printf '%s\n' "$ip"
+}
+
+cloudflare_api() {
+  local token="$1" method="$2" path="$3" data="${4:-}" response
+  local -a args=(-fsS --connect-timeout 6 --max-time 25 --config - -X "$method" -H 'Content-Type: application/json')
+  [[ -z "$data" ]] || args+=(--data "$data")
+  # Token 经标准输入交给 curl，避免出现在进程参数中。
+  response="$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+    curl "${args[@]}" "https://api.cloudflare.com/client/v4/$path")" || { fail 'Cloudflare 请求失败，请检查网络和 API Token 权限。'; return 1; }
+  jq -e '.success==true' <<< "$response" >/dev/null || { fail 'Cloudflare 拒绝请求。Token 需具备该域名的区域读取和 DNS 编辑权限。'; return 1; }
+  printf '%s\n' "$response"
+}
+
+cloudflare_sync() {
+  local cfg="$1" ip="$2" token domain family zone record result suffix payload type record_count
+  token="$(jq -er .token <<< "$cfg")" || return 1
+  domain="$(jq -er .host <<< "$cfg")" || return 1
+  family="$(jq -r '.family // "4"' <<< "$cfg")"
+  if [[ "$family" == 6 ]]; then type=AAAA; else type=A; fi
+  zone="$(jq -r '.zone_id // empty' <<< "$cfg")"
+  if [[ -z "$zone" ]]; then
+    suffix="$domain"
+    while [[ "$suffix" == *.* ]]; do
+      result="$(cloudflare_api "$token" GET "zones?name=$suffix")" || return 1
+      zone="$(jq -r '.result[0].id // empty' <<< "$result")"
+      [[ -z "$zone" ]] || break
+      suffix="${suffix#*.}"
+    done
+  fi
+  [[ "$zone" =~ ^[a-fA-F0-9]{32}$ ]] || { fail '未找到此域名的 Cloudflare 区域，请确认域名和 Token 的访问范围。'; return 1; }
+  result="$(cloudflare_api "$token" GET "zones/$zone/dns_records?type=$type&name=$domain")" || return 1
+  record_count="$(jq -er '.result|length' <<< "$result")" || return 1
+  ((record_count <= 1)) || { fail '同名 DNS 记录不止一条，请先在 Cloudflare 整理该域名的记录。'; return 1; }
+  payload="$(jq -n --arg name "$domain" --arg type "$type" --arg ip "$ip" '{type:$type,name:$name,content:$ip,ttl:120,proxied:false}')" || return 1
+  if ((record_count == 0)); then
+    result="$(cloudflare_api "$token" POST "zones/$zone/dns_records" "$payload")" || return 1
+    record="$(jq -er .result.id <<< "$result")" || return 1
+  else
+    record="$(jq -er '.result[0].id' <<< "$result")" || return 1
+    [[ "$record" =~ ^[a-fA-F0-9]{32}$ ]] || { fail 'Cloudflare 返回的记录 ID 无效。'; return 1; }
+    if ! jq -e --arg ip "$ip" '.result[0] | .content==$ip and .proxied==false' <<< "$result" >/dev/null; then
+      cloudflare_api "$token" PATCH "zones/$zone/dns_records/$record" "$payload" >/dev/null || return 1
+    fi
+  fi
+  jq --arg zone "$zone" --arg record "$record" '.zone_id=$zone | .record_id=$record' <<< "$cfg"
+}
+
+duckdns_sync() {
+  local cfg="$1" ip="$2" domain token family sub response encoded_ip url
+  domain="$(jq -er .host <<< "$cfg")" || return 1
+  token="$(jq -er .token <<< "$cfg")" || return 1
+  family="$(jq -r '.family // "4"' <<< "$cfg")"
+  sub="${domain%.duckdns.org}"
+  [[ "$domain" == *.duckdns.org && "$sub" != *.* && -n "$sub" ]] || { fail 'DuckDNS 需要填写你已申请的 xxx.duckdns.org 域名。'; return 1; }
+  encoded_ip="$(jq -rn --arg ip "$ip" '$ip|@uri')"
+  url="https://www.duckdns.org/update?domains=$sub&token=$token"
+  if [[ "$family" == 6 ]]; then url+="&ip=&ipv6=$encoded_ip"; else url+="&ip=$encoded_ip"; fi
+  response="$(printf 'url = "%s"\n' "$url" | curl -fsS --connect-timeout 6 --max-time 25 --config -)" || { fail 'DuckDNS 请求失败，请检查网络。'; return 1; }
+  [[ "${response%%$'\n'*}" == OK ]] || { fail 'DuckDNS 更新失败，请确认域名归属和 Token。'; return 1; }
+  printf '%s\n' "$cfg"
+}
+
+ddns_update() {
+  local config_file="${1:-$DDNS_FILE}" cfg provider family ip tmp token domain
+  [[ -s "$config_file" ]] || { fail '尚未配置本机 DDNS 自动更新。请到高级设置 → DDNS 自动更新中配置。'; return 1; }
+  cfg="$(jq -ec 'select(type=="object")' "$config_file")" || return 1
+  provider="$(jq -er .provider <<< "$cfg")" || return 1
+  family="$(jq -r '.family // "4"' <<< "$cfg")"
+  domain="$(jq -er .host <<< "$cfg")" || return 1
+  token="$(jq -er .token <<< "$cfg")" || return 1
+  valid_domain "$domain" && [[ "$token" =~ ^[a-zA-Z0-9_-]{10,200}$ && "$family" =~ ^[46]$ ]] || { fail 'DDNS 配置无效，请重新配置。'; return 1; }
+  ip="$(detect_public_ip "$family")" || { fail "无法获取公网 IPv$family，本次未修改 DNS。"; return 1; }
+  case "$provider" in
+    cloudflare) cfg="$(cloudflare_sync "$cfg" "$ip")" || return 1 ;;
+    duckdns) cfg="$(duckdns_sync "$cfg" "$ip")" || return 1 ;;
+    *) fail 'DDNS 服务商无效。'; return 1 ;;
+  esac
+  tmp="$(mktemp "$ETC_DIR/.ddns.XXXXXX")" || return 1
+  jq --arg ip "$ip" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_ip=$ip | .last_success=$now' <<< "$cfg" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$config_file"
+  info "DDNS 已更新：$domain → $ip。" >&2
+}
+
+check_ddns_unit() {
+  local path="$1"
+  [[ ! -e "$path" && ! -L "$path" ]] && return 0
+  [[ ! -L "$path" ]] && grep -Fq '# XSS-MANAGED: xnode-ddns' "$path" && return 0
+  fail "DDNS 定时任务路径已被其他文件占用：$path"
+}
+
+install_ddns_scheduler() {
+  local jobs task
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    check_ddns_unit "$DDNS_SERVICE_FILE" && check_ddns_unit "$DDNS_TIMER_FILE" || return 1
+    mkdir -p "$(dirname "$DDNS_SERVICE_FILE")" "$(dirname "$DDNS_TIMER_FILE")" || return 1
+    cat > "$DDNS_SERVICE_FILE" <<EOF
+# XSS-MANAGED: xnode-ddns
+[Unit]
+Description=Xnode DDNS update
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+Environment="XSS_ETC_DIR=$ETC_DIR"
+ExecStart="$ENTRY" ddns-update
+EOF
+    cat > "$DDNS_TIMER_FILE" <<'EOF'
+# XSS-MANAGED: xnode-ddns
+[Unit]
+Description=Update Xnode DDNS every five minutes
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=30s
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 644 "$DDNS_SERVICE_FILE" "$DDNS_TIMER_FILE"
+    systemctl daemon-reload && systemctl enable --now xnode-ddns.timer || return 1
+  else
+    command -v crontab >/dev/null 2>&1 || { fail '系统没有可用的定时任务工具。请安装并启动 cron，或使用路由器/ddns-go 更新域名。'; return 1; }
+    [[ "$ENTRY" =~ ^/[a-zA-Z0-9_./-]+$ && "$ETC_DIR" =~ ^/[a-zA-Z0-9_./-]+$ ]] || { fail 'cron 自动更新需要使用常规安装路径，例如 /usr/local/bin/xnode 和 /etc/xray-ss。'; return 1; }
+    jobs="$(crontab -l 2>/dev/null || true)"
+    task="*/5 * * * * XSS_ETC_DIR=$ETC_DIR $ENTRY ddns-update >/dev/null 2>&1 # XSS-MANAGED: xnode-ddns"
+    { if [[ -n "$jobs" ]]; then printf '%s\n' "$jobs" | awk '!/# XSS-MANAGED: xnode-ddns$/'; fi; printf '%s\n' "$task"; } | crontab - || return 1
+    warn '已写入每 5 分钟执行的 cron 任务；请确保系统的 cron 服务正在运行。'
+  fi
+  info 'DDNS 自动更新已启用，每 5 分钟检查一次。'
+}
+
+remove_ddns_scheduler() {
+  local jobs path managed_timer=0
+  [[ -f "$DDNS_FILE" ]] || return 0
+  if [[ -f "$DDNS_TIMER_FILE" && ! -L "$DDNS_TIMER_FILE" ]] && grep -Fq '# XSS-MANAGED: xnode-ddns' "$DDNS_TIMER_FILE"; then managed_timer=1; fi
+  if ((managed_timer)) && command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now xnode-ddns.timer >/dev/null 2>&1 || return 1
+    systemctl stop xnode-ddns.service >/dev/null 2>&1 || true
+  fi
+  for path in "$DDNS_TIMER_FILE" "$DDNS_SERVICE_FILE"; do
+    if [[ -f "$path" && ! -L "$path" ]] && grep -Fq '# XSS-MANAGED: xnode-ddns' "$path"; then rm -f "$path" || return 1; fi
+  done
+  if ((managed_timer)); then systemctl daemon-reload || return 1; fi
+  if command -v crontab >/dev/null 2>&1; then
+    jobs="$(crontab -l 2>/dev/null || true)"
+    if [[ "$jobs" == *'# XSS-MANAGED: xnode-ddns'* ]]; then
+      printf '%s\n' "$jobs" | awk '!/# XSS-MANAGED: xnode-ddns$/' | crontab - || return 1
+    fi
+  fi
+}
+
+configure_ddns() {
+  local provider="$1" host token family cfg tmp
+  init_config || return 1
+  read -r -p '你拥有的 DDNS 域名（例如 node.example.com 或 xxx.duckdns.org，0 返回）：' host || return 1
+  [[ "$host" != 0 ]] || return 1
+  host="${host,,}"
+  valid_domain "$host" || { fail '域名格式无效。'; return 1; }
+  if [[ "$provider" == cloudflare ]]; then
+    say '请准备仅授权此域名的 API Token：区域读取 + DNS 编辑；此记录将设为“仅 DNS”，关闭橙云代理。' >&2
+  else
+    [[ "$host" == *.duckdns.org && "${host%.duckdns.org}" != *.* ]] || { fail '请先在 DuckDNS 申请 xxx.duckdns.org 域名。'; return 1; }
+    say '填写 DuckDNS 账户的 Token。' >&2
+  fi
+  read -r -s -p 'API Token（输入不回显）：' token || return 1
+  printf '\n' >&2
+  [[ "$token" =~ ^[a-zA-Z0-9_-]{10,200}$ ]] || { fail 'Token 格式无效。'; return 1; }
+  read -r -p '更新的 IP 版本 [4/6，默认 4]：' family || return 1
+  family="${family:-4}"
+  [[ "$family" =~ ^[46]$ ]] || { fail '请输入 4 或 6。'; return 1; }
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    check_ddns_unit "$DDNS_SERVICE_FILE" && check_ddns_unit "$DDNS_TIMER_FILE" || return 1
+  else
+    command -v crontab >/dev/null 2>&1 || { fail '请先安装并启动 cron，或选择已有 DDNS。'; return 1; }
+  fi
+  cfg="$(jq -n --arg provider "$provider" --arg host "$host" --arg token "$token" --arg family "$family" \
+    '{provider:$provider,host:$host,token:$token,family:$family}')" || return 1
+  tmp="$(mktemp "$ETC_DIR/.ddns-setup.XXXXXX")" || return 1
+  printf '%s\n' "$cfg" > "$tmp"
+  chmod 600 "$tmp"
+  if ! ddns_update "$tmp"; then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$DDNS_FILE"
+  install_ddns_scheduler || { fail 'DNS 已更新，但定时任务启用失败。配置已保留，可在 DDNS 菜单重新配置或立即更新。'; return 1; }
+  say '请确保此域名没有指向其他旧 IP 的记录；若还有其他设备更新同一域名，请关闭重复更新。'
+}
+
+choose_dynamic_host() {
+  local choice host saved=''
+  if [[ -f "$DDNS_FILE" ]]; then saved="$(jq -r '.host // empty' "$DDNS_FILE")" || return 1; fi
+  ui_title '动态 IP 使用 DDNS 域名' >&2
+  ui_item 1 '使用已有 DDNS（路由器、ddns-go 等已负责更新）' >&2
+  ui_item 2 '配置 Cloudflare 自动更新（需要自己的域名和 Token）' >&2
+  ui_item 3 '配置 DuckDNS 自动更新（需要已申请的免费域名和 Token）' >&2
+  ui_item 0 '返回' >&2
+  read -r -p '请选择 DDNS 方式 [1-3，默认 1，0 返回]：' choice || return 1
+  case "$choice" in
+    1|'')
+      read -r -p "DDNS 域名${saved:+（回车沿用 $saved）}：" host || return 1
+      host="${host:-$saved}"
+      valid_domain "$host" || { fail '请输入已配置好的 DDNS 域名。'; return 1; }
+      if [[ "$host" == "$saved" && -n "$saved" ]]; then info '沿用已配置的本机 DDNS 自动更新。' >&2
+      else warn '请确保路由器或 DDNS 客户端持续更新此域名；只填写域名不会自动更新 DNS。'; fi
+      ;;
+    2|3)
+      if [[ "$choice" == 2 ]]; then configure_ddns cloudflare >&2 || return 1
+      else configure_ddns duckdns >&2 || return 1; fi
+      host="$(jq -er .host "$DDNS_FILE")" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$host"
+}
+
+ddns_menu() {
+  local ans
+  while :; do
+    ui_title 'DDNS 自动更新'
+    if [[ -f "$DDNS_FILE" ]]; then
+      jq -r '"  域名：\(.host)  ·  服务商：\(.provider)","  上次成功：\(.last_success // "尚未更新")  ·  IP：\(.last_ip // "未知")"' "$DDNS_FILE"
+    else say '  尚未配置本机自动更新；已有路由器/DDNS 客户端的用户可以直接使用其域名。'; fi
+    ui_item 1 '配置 Cloudflare 自动更新'
+    ui_item 2 '配置 DuckDNS 自动更新'
+    ui_item 3 '立即更新一次'
+    ui_item 4 '停止本机自动更新并清除 Token'
+    ui_back
+    read -r -p '请选择 [1-4 / 0]：' ans || return 0
+    case "$ans" in
+      1) configure_ddns cloudflare || true ;;
+      2) configure_ddns duckdns || true ;;
+      3) ddns_update || true ;;
+      4) if remove_ddns_scheduler; then rm -f "$DDNS_FILE"; info '本机 DDNS 自动更新已停止，Token 已清除。节点仍使用原域名。'; fi ;;
+      0) return 0 ;;
+      '') continue ;;
+      *) warn '请输入 1～4，或输入 0 返回。' ;;
+    esac
+  done
+}
+
 detect_public_host() {
-  local ip
-  ip="$(curl -4fsSL --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null || true)"
-  if valid_ipv4 "$ip"; then printf '%s\n' "$ip"; return 0; fi
-  ip="$(curl -6fsSL --connect-timeout 4 --max-time 8 https://api6.ipify.org 2>/dev/null || true)"
-  if valid_ipv6 "$ip"; then printf '%s\n' "$ip"; return 0; fi
-  return 1
+  detect_public_ip 4 || detect_public_ip 6
 }
 
 choose_node_host() {
@@ -1048,6 +1526,75 @@ remove_node_host() {
   fi
   chmod 600 "$tmp"
   mv -f "$tmp" "$NODE_HOSTS_FILE"
+  if [[ -f "$NODE_META_FILE" ]]; then
+    tmp="$(mktemp "$ETC_DIR/.node-meta.XXXXXX")" || return 1
+    jq -e --arg t "$tag" 'del(.[$t])' "$NODE_META_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$NODE_META_FILE"
+  fi
+}
+
+save_node_meta() {
+  local tag="$1" meta="$2" tmp
+  tmp="$(mktemp "$ETC_DIR/.node-meta.XXXXXX")" || return 1
+  if ! jq -e --arg t "$tag" --argjson m "$meta" '.[$t]=($m|del(.host,.port))' "$NODE_META_FILE" > "$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$NODE_META_FILE"
+}
+
+node_public_port() {
+  local tag="$1" port=''
+  if [[ -f "$NODE_META_FILE" ]]; then
+    port="$(jq -er --arg t "$tag" '.[$t].public_port // empty' "$NODE_META_FILE")" || port=''
+  fi
+  if [[ -z "$port" ]]; then port="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.port' "$CONFIG")" || return 1; fi
+  normalize_port "$port" || { fail '节点公网端口无效。'; return 1; }
+}
+
+node_reality_public_key() {
+  local tag="$1" key='' private output
+  if [[ -f "$NODE_META_FILE" ]]; then
+    key="$(jq -er --arg t "$tag" '.[$t].reality_public_key // empty' "$NODE_META_FILE")" || key=''
+  fi
+  if [[ -z "$key" ]]; then
+    private="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.streamSettings.realitySettings.privateKey' "$CONFIG")" || return 1
+    output="$("$CORE_LINK" x25519 -i "$private")" || return 1
+    key="$(awk -F: '{k=$1;gsub(/[[:space:]]/,"",k);if(tolower(k)=="publickey" || tolower(k)=="password"){sub(/^[^:]*:[[:space:]]*/,"");gsub(/\r/,"");print;exit}}' <<< "$output")"
+  fi
+  [[ "$key" =~ ^[a-zA-Z0-9_-]{43}$ ]] || { fail '无法读取此节点的 Reality 公钥。'; return 1; }
+  printf '%s\n' "$key"
+}
+
+make_node_uri() {
+  local tag="$1" node host port display protocol method password uuid sni sid public label hostpart
+  node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CONFIG")" || return 1
+  host="$(node_share_host "$tag")" || return 1
+  port="$(node_public_port "$tag")" || return 1
+  display="$(visible_node_name "$tag")"
+  protocol="$(jq -r .protocol <<< "$node")"
+  case "$protocol" in
+    shadowsocks)
+      jq -e '.settings.users==null' <<< "$node" >/dev/null || { fail '旧版多用户节点请查看全部链接。'; return 1; }
+      method="$(jq -er .settings.method <<< "$node")" || return 1
+      password="$(jq -er .settings.password <<< "$node")" || return 1
+      make_ss_uri "$method" "$password" "$host" "$port" "$display"
+      ;;
+    vless)
+      jq -e '.streamSettings.security=="reality" and (.settings.clients|length)==1' <<< "$node" >/dev/null || return 1
+      public="$(node_reality_public_key "$tag")" || return 1
+      uuid="$(jq -er '.settings.clients[0].id' <<< "$node")" || return 1
+      sni="$(jq -er '.streamSettings.realitySettings.serverNames[0]' <<< "$node")" || return 1
+      sid="$(jq -er '.streamSettings.realitySettings.shortIds[0]' <<< "$node")" || return 1
+      sni="$(jq -rn --arg s "$sni" '$s|@uri')"
+      label="$(jq -rn --arg s "$display" '$s|@uri')"
+      hostpart="$host"; [[ "$host" != *:* ]] || hostpart="[$host]"
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=%s&fp=chrome&pbk=%s&sid=%s#%s\n' \
+        "$uuid" "$hostpart" "$port" "$sni" "$public" "$sid" "$label"
+      ;;
+    *) fail '暂不支持此节点的分享链接。'; return 1 ;;
+  esac
 }
 
 node_share_host() {
@@ -1084,46 +1631,63 @@ make_ss_uri() {
 
 
 show_node_connection() {
-  local tag="$1" fields name display port method password network host uri network_zh
-  [[ -s "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
-  # 旧版创建的多用户节点不会被转换或删除，历史链接仍可通过 links 命令获取。
-  fields="$(jq -er --arg tag "$tag" '.inbounds[]? | select(.tag==$tag and .settings.users==null) | [.tag, (.port|tostring), .settings.method, .settings.password, (.settings.network // "tcp")] | @tsv' "$CONFIG")" || {
-    fail '未找到可独立显示连接信息的节点；如为旧版多用户节点，请使用 xnode links 查看原有链接。'
-    return 1
-  }
-  IFS=$'\t' read -r name port method password network <<< "$fields"
-  display="$(visible_node_name "$name")"
-  case "$network" in
-    tcp) network_zh='仅 TCP' ;;
-    udp) network_zh='仅 UDP' ;;
-    *) network_zh='TCP + UDP' ;;
-  esac
+  local tag="$1" node display host port public_port uri protocol method network
+  node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CONFIG")" || return 1
+  uri="$(make_node_uri "$tag")" || return 1
+  host="$(node_share_host "$tag")" || return 1
+  port="$(jq -r .port <<< "$node")"
+  public_port="$(node_public_port "$tag")" || return 1
+  display="$(visible_node_name "$tag")"
+  protocol="$(jq -r .protocol <<< "$node")"
   say ''
   say '========== 节点连接信息 =========='
   say "节点名称：$display"
-  say "节点端口：$port"
-  say "加密方式：$method"
-  say "传输方式：$network_zh"
-  say "连接密码：$password"
-  host="$(node_share_host "$tag")" || {
-    warn '无法生成连接链接：没有可用的服务器公网地址。'
-    return 1
-  }
-  uri="$(make_ss_uri "$method" "$password" "$host" "$port" "$display")" || return 1
   say "服务器地址：$host"
-  say ''
-  say 'SS / SS2022 分享链接（复制到客户端即可导入）：'
+  say "公网访问端口：$public_port"
+  say "本机监听端口：$port"
+  if [[ "$protocol" == vless ]]; then
+    say '协议：VLESS + Reality'
+    say "用户 UUID：$(jq -r '.settings.clients[0].id' <<< "$node")"
+    say "Reality 伪装域名：$(jq -r '.streamSettings.realitySettings.serverNames[0]' <<< "$node")"
+    say "Reality 公钥：$(node_reality_public_key "$tag")"
+    say '传输方式：TCP；客户端需支持 Reality 和 Vision。'
+    say ''
+    say 'VLESS + Reality 分享链接（复制到客户端即可导入）：'
+  else
+    method="$(jq -r .settings.method <<< "$node")"
+    if [[ "$method" == 2022-* ]]; then say '协议：SS2022'; else say '协议：SS'; fi
+    say "加密方式：$method"
+    network="$(jq -r '.settings.network // "tcp"' <<< "$node")"
+    case "$network" in tcp) say '传输方式：仅 TCP' ;; udp) say '传输方式：仅 UDP' ;; *) say '传输方式：TCP + UDP' ;; esac
+    say "连接密码：$(jq -r .settings.password <<< "$node")"
+    say ''
+    say 'SS / SS2022 分享链接（复制到客户端即可导入）：'
+  fi
   printf '%s\n' "$uri"
   say '=================================='
-  warn '分享链接包含节点密码，请妥善保管。'
+  warn '分享链接包含连接凭据，请妥善保管。'
 }
 
 # 从节点真实入站配置生成可复制到 Xray outbounds 数组中的单个出站对象。
 # 使用 jq 构建 JSON，避免中文节点名、Base64 密钥等内容被手工拼接破坏。
 # 配置沿用 Xray 兼容的 settings.servers 形式，以便旧版 3x-ui 手动添加出站。
 make_node_outbound_json() {
-  local tag="$1" host json display_tag
+  local tag="$1" host json display_tag port protocol public
   [[ -s "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
+  host="$(node_share_host "$tag")" || return 1
+  port="$(node_public_port "$tag")" || return 1
+  display_tag="$(visible_node_name "$tag")" || return 1
+  protocol="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.protocol' "$CONFIG")" || return 1
+  if [[ "$protocol" == vless ]]; then
+    public="$(node_reality_public_key "$tag")" || return 1
+    jq -e --arg t "$tag" --arg host "$host" --argjson port "$port" --arg display "$display_tag" --arg public "$public" '
+      .inbounds[]|select(.tag==$t and .streamSettings.security=="reality" and (.settings.clients|length)==1)|
+      {tag:$display,protocol:"vless",settings:{vnext:[{address:$host,port:$port,
+        users:[{id:.settings.clients[0].id,encryption:"none",flow:(.settings.clients[0].flow // "xtls-rprx-vision")}]}]},
+       streamSettings:{network:"tcp",security:"reality",realitySettings:{fingerprint:"chrome",publicKey:$public,
+         serverName:.streamSettings.realitySettings.serverNames[0],shortId:.streamSettings.realitySettings.shortIds[0]}}}' "$CONFIG"
+    return $?
+  fi
   if ! jq -e --arg t "$tag" '
       .inbounds[]? |
       select(.tag==$t and .protocol=="shadowsocks" and .settings.users==null and
@@ -1133,10 +1697,9 @@ make_node_outbound_json() {
     fail '当前节点不是可导出的单用户 SS / SS2022 节点，无法生成出站 JSON。'
     return 1
   fi
-  host="$(node_share_host "$tag")" || return 1
   # 出站 tag 与菜单显示的节点名称一致；兼容旧 xss- 节点的显示名 ss-。
   display_tag="$(visible_node_name "$tag")" || return 1
-  json="$(jq -e --arg t "$tag" --arg host "$host" --arg display_tag "$display_tag" '
+  json="$(jq -e --arg t "$tag" --arg host "$host" --argjson port "$port" --arg display_tag "$display_tag" '
     .inbounds[]? |
     select(.tag==$t and .protocol=="shadowsocks" and .settings.users==null) |
     {
@@ -1145,7 +1708,7 @@ make_node_outbound_json() {
       settings: {
         servers: [{
           address: $host,
-          port: .port,
+          port: $port,
           method: .settings.method,
           password: .settings.password
         }]
@@ -1172,15 +1735,16 @@ show_node_outbound_json() {
 show_links() {
   [[ -f "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
   if ! jq -e '.inbounds | length>0' "$CONFIG" >/dev/null; then
-    say '当前没有任何节点。主菜单选择 1 即可一键创建。'
+    say '当前没有任何节点。主菜单选择 1 即可快速创建。'
     return 0
   fi
   ui_title '节点分享链接'
-  say '复制 ss:// 开头的完整一行，在客户端选择“从剪贴板导入”。'
+  say '复制 ss:// 或 vless:// 开头的完整一行，在客户端选择“从剪贴板导入”。'
   local host tag display port method password nickname
   while IFS=$'\t' read -r tag port method password nickname; do
     [[ -n "$tag" ]] || continue
     host="$(node_share_host "$tag")" || { warn "节点 $tag 的分享链接生成失败，已跳过。"; continue; }
+    port="$(node_public_port "$tag")" || continue
     display="$(visible_node_name "$tag")"
     if [[ "$nickname" == '节点' ]]; then
       printf '\n%s\n' "$display"
@@ -1189,7 +1753,12 @@ show_links() {
       printf '\n%s / %s\n' "$display" "$nickname"
       make_ss_uri "$method" "$password" "$host" "$port" "$display-$nickname"
     fi
-  done < <(jq -r '.inbounds[]? | . as $n | if (.settings.users | type)=="array" then .settings.users[] | [$n.tag, ($n.port|tostring), ($n.settings.method // .method), (if (($n.settings.method // "") | startswith("2022-")) then ($n.settings.password + ":" + .password) else .password end), (.email // "user")] | @tsv else [$n.tag, ($n.port|tostring), .settings.method, .settings.password, "节点"] | @tsv end' "$CONFIG")
+  done < <(jq -r '.inbounds[]? | select(.protocol=="shadowsocks") | . as $n | if (.settings.users | type)=="array" then .settings.users[] | [$n.tag, ($n.port|tostring), ($n.settings.method // .method), (if (($n.settings.method // "") | startswith("2022-")) then ($n.settings.password + ":" + .password) else .password end), (.email // "user")] | @tsv else [$n.tag, ($n.port|tostring), .settings.method, .settings.password, "节点"] | @tsv end' "$CONFIG")
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    printf '\n%s\n' "$(visible_node_name "$tag")"
+    make_node_uri "$tag" || warn "节点 $tag 的分享链接生成失败。"
+  done < <(jq -r '.inbounds[]?|select(.protocol=="vless")|.tag' "$CONFIG")
   warn '以上链接包含节点密钥，请妥善保管，不要公开传播。'
 }
 
@@ -1204,7 +1773,7 @@ view_node_connections() {
   while :; do
     say ''
     ui_title "查看节点：$(visible_node_name "$tag")"
-    ui_item 1 '查看 SS / SS2022 连接链接'
+    ui_item 1 '查看 SS / SS2022 / Reality 连接链接'
     ui_item 2 '查看 Xray 出站 JSON（用于 3x-ui 手动添加出站）'
     ui_back
     read -r -p '请输入选项（1/2/0）：' choice || return 0
@@ -1262,6 +1831,7 @@ uninstall_manager() {
   if [[ -n "$owned_service_file" ]]; then
     check_managed_service_file "$owned_service_file" || return 1
   fi
+  remove_ddns_scheduler || { fail '停止 DDNS 定时任务失败，已取消卸载。'; return 1; }
   service_disable || true
   case "$INIT_SYSTEM" in
     systemd) rm -f "$UNIT_FILE"; systemctl daemon-reload ;;
@@ -1311,18 +1881,20 @@ node_menu() {
     ui_title "管理节点：$(visible_node_name "$tag")"
     ui_item 1 '查看连接信息 / 复制链接'
     ui_item 2 '导出 Xray 出站 JSON（用于 3x-ui）'
-    ui_item 3 '修改节点端口'
-    ui_text '31' '  4）删除当前节点'
+    ui_item 3 '修改本机监听端口'
+    ui_item 4 '修改公网地址 / DDNS / NAT 映射'
+    ui_text '31' '  5）删除当前节点'
     ui_back '返回主菜单'
-    read -r -p '请选择 [1-4 / 0]：' ans || return 0
+    read -r -p '请选择 [1-5 / 0]：' ans || return 0
     case "$ans" in
       1) show_node_connection "$tag" || true ;;
       2) show_node_outbound_json "$tag" || true ;;
       3) change_port "$tag" || true ;;
-      4) if delete_node "$tag"; then return 0; fi ;;
+      4) change_node_endpoint "$tag" || true ;;
+      5) if delete_node "$tag"; then return 0; fi ;;
       0) return 0 ;;
       '') continue ;;
-      *) warn '请输入 1～4，或输入 0 返回。' ;;
+      *) warn '请输入 1～5，或输入 0 返回。' ;;
     esac
   done
 }
@@ -1361,20 +1933,22 @@ advanced_menu() {
     ui_title '高级设置'
     ui_item 1 '自定义创建节点（名称 / 加密 / 端口 / 域名）'
     ui_item 2 "安装或切换 Xray 内核版本（默认 $DEFAULT_XRAY_VERSION）"
-    ui_item 3 '检测 Linux 系统兼容性'
+    ui_item 3 'DDNS 自动更新（Cloudflare / DuckDNS）'
+    ui_item 4 '检测 Linux 系统兼容性'
     say ''
-    ui_text '31' '  4）完全卸载管理脚本及受管服务'
+    ui_text '31' '  5）完全卸载管理脚本及受管服务'
     ui_back '返回主菜单'
-    read -r -p '请选择 [1-4 / 0]：' ans || return 0
+    read -r -p '请选择 [1-5 / 0]：' ans || return 0
     case "$ans" in
       1) add_node || true ;;
       2) tag="$(release_menu)" && switch_version "$tag" || true ;;
-      3) check_compatibility || true ;;
+      3) ddns_menu ;;
+      4) check_compatibility || true ;;
       # 返回专用状态，通知主菜单一并退出，避免卸载后继续操作。
-      4) if uninstall_manager; then return 10; fi ;;
+      5) if uninstall_manager; then return 10; fi ;;
       0) return 0 ;;
       '') continue ;;
-      *) warn '请输入 1～4，或输入 0 返回。' ;;
+      *) warn '请输入 1～5，或输入 0 返回。' ;;
     esac
   done
 }
@@ -1382,19 +1956,19 @@ advanced_menu() {
 menu() {
   local ans result
   while :; do
-    ui_title 'Xray 节点管理系统（SS / SS2022）'
+    ui_title 'Xray 节点管理系统（SS / SS2022 / Reality）'
     menu_summary
     ui_section '常用操作'
-    ui_text '1;32' '  1）一键创建节点（推荐新手）'
+    ui_text '1;32' '  1）快速创建节点（SS / SS2022 / VLESS + Reality）'
     ui_item 2 '查看 / 复制分享链接'
     ui_item 3 '查看已有节点'
     ui_section '管理与维护'
-    ui_item 4 '管理节点（连接信息 / 出站 JSON / 端口 / 删除）'
+    ui_item 4 '管理节点（连接信息 / 出站 JSON / 地址与端口）'
     ui_item 5 '服务管理（状态 / 重启 / 日志）'
-    ui_item 6 '高级设置（自定义创建 / 内核版本 / 检测 / 卸载）'
+    ui_item 6 '高级设置（自定义创建 / 内核 / DDNS / 卸载）'
     ui_back '退出管理系统'
-    say '  新手：选 1 创建 → 复制 ss:// 链接 → 导入客户端'
-    say '  首次创建自动准备内核；需要指定端口或域名请选 6 → 1。'
+    say '  新手：选 1 → 选协议和网络环境 → 复制链接导入客户端'
+    say '  NAT 请先查看服务商/路由器分配的端口；动态 IP 请选择 DDNS。'
     say ''
     read -r -p '请选择 [1-6 / 0]：' ans || return 0
     case "$ans" in
@@ -1419,16 +1993,18 @@ menu() {
 
 usage() {
   cat <<'TXT'
-Xray 中文节点管理系统（SS / SS2022，v0.10.1）
+Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
-      sudo xnode add           # 一键创建节点并显示分享链接
+      sudo xnode add           # 选择协议和网络环境，快速创建节点
       sudo xnode custom        # 自定义名称、加密方式、端口及域名
       sudo xnode links         # 查看所有节点分享链接
       sudo xnode list          # 查看已有节点
       sudo xnode show          # 选择节点，查看分享链接或出站 JSON
       sudo xnode status        # 查看服务状态
       sudo xnode logs          # 查看运行日志
+      sudo xnode ddns          # 配置 DDNS 自动更新
+      sudo xnode ddns-update   # 立即更新一次 DDNS
       sudo xnode install-default   # 安装默认 Xray 内核版本 v26.6.1
       bash xray-ss.sh check # 检测系统兼容性（无须 root）
 支持多种 Linux 发行版；服务管理方式：systemd / OpenRC / SysVinit / runit / procd / 手动。
@@ -1466,6 +2042,7 @@ main() {
   case "${1:-}" in
     --help|-h|help) usage; return 0 ;;
     check) check_compatibility; return $? ;;
+    ddns-update) require_root || return 1; ddns_update; return $? ;;
   esac
   require_root
   need_env
@@ -1478,6 +2055,7 @@ main() {
     list) list_nodes ;;
     status) status ;;
     logs) logs ;;
+    ddns) ddns_menu ;;
     install-default) switch_version "$DEFAULT_XRAY_VERSION" ;;
     '') menu ;;
     *) usage; return 1 ;;

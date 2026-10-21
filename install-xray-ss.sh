@@ -55,7 +55,7 @@ grep -Fq 'SCRIPT_DIR=' "$tmp/install.sh" || error 'install.sh 内容不符合预
 grep -Fq '# Xray SS Manager:' "$tmp/xray-ss.sh" || error 'xray-ss.sh 内容不符合预期，已停止执行。'
 chmod 700 "$tmp/install.sh" "$tmp/xray-ss.sh"
 
-say '[+] 下载成功，正在启动 Xray 中文管理系统（当前支持 SS / SS2022）。'
+say '[+] 下载成功，正在启动 Xray 中文管理系统（SS / SS2022 / VLESS + Reality）。'
 if [ "$(id -u)" -eq 0 ]; then
   sh "$tmp/install.sh" "$@"
 elif command -v sudo >/dev/null 2>&1; then
