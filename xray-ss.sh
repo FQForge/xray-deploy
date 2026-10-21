@@ -32,11 +32,18 @@ PID_FILE="${XSS_PID_FILE:-/run/xray-ss.pid}"
 MANUAL_UNIT_FILE="${XSS_MANUAL_UNIT_FILE:-$OPT_DIR/standalone-service.sh}"
 GITHUB_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 # 默认安装目标版本；保留手动输入/选择其他版本的能力。
-DEFAULT_XRAY_VERSION='v26.6.1'
+DEFAULT_XRAY_VERSION='v26.10.10'
+# 与 3x-ui 实测对照通过的版本；旧 v26.6.1 会拒绝较大的 TLS 证书记录。
+REALITY_MIN_XRAY_VERSION='v26.10.10'
 # 三种协议在创建时选择；快速创建使用对应的默认加密和 Reality 参数。
 DEFAULT_SS_METHOD='aes-256-gcm'
 DEFAULT_SS2022_METHOD='2022-blake3-aes-256-gcm'
-DEFAULT_REALITY_SERVER='www.microsoft.com'
+# 已在 VPS 上逐个通过 Reality + Vision 和 HTTPS 测试的非 Cloudflare 目标。
+# 每次创建打乱顺序，并在当前服务器重新实测，失败时继续尝试下一项。
+REALITY_SERVERS=(
+  www.bing.com www.amazon.com www.samsung.com www.nvidia.com www.sony.com
+  www.oracle.com www.intel.com www.adobe.com www.yahoo.com www.ebay.com
+)
 DISTRO_ID=unknown
 DISTRO_NAME=unknown
 DISTRO_ID_LIKE=''
@@ -637,12 +644,12 @@ download_version() (
 
 switch_version() {
   local tag="$1" target="$CORE_DIR/$1/xray" old='' link_tmp
-  valid_version "$tag" || fail '版本号格式无效。'
-  need_env
-  init_config
+  valid_version "$tag" || { fail '版本号格式无效。'; return 1; }
+  need_env || return 1
+  init_config || return 1
   install_service_unit || return 1
   download_version "$tag" || return 1
-  "$target" run -test -format json -config "$CONFIG" || fail "当前节点配置与 Xray $tag 不兼容，已取消切换。"
+  "$target" run -test -format json -config "$CONFIG" || { fail "当前节点配置与 Xray $tag 不兼容，已取消切换。"; return 1; }
   [[ ! -L "$CORE_LINK" ]] || old="$(readlink "$CORE_LINK")"
   if [[ -e "$CORE_LINK" && ! -L "$CORE_LINK" ]]; then
     fail "目标路径 $CORE_LINK 已存在非符号链接文件，为避免覆盖已停止安装。"
@@ -774,6 +781,29 @@ ensure_core_for_new_node() {
   switch_version "$DEFAULT_XRAY_VERSION"
 }
 
+# 按数字比较正式版本部分，避免把 26.6.1 按字符串误判为新于 26.10.10。
+version_at_least() {
+  local current="${1#v}" minimum="${2#v}" i
+  local -a actual=() required=()
+  valid_version "v$current" && valid_version "v$minimum" || return 1
+  IFS=. read -r -a actual <<< "${current%%-*}"
+  IFS=. read -r -a required <<< "${minimum%%-*}"
+  for ((i=0; i<4; i++)); do
+    if ((10#${actual[i]:-0} > 10#${required[i]:-0})); then return 0; fi
+    if ((10#${actual[i]:-0} < 10#${required[i]:-0})); then return 1; fi
+  done
+  return 0
+}
+
+ensure_reality_core() {
+  local current
+  need_core || return 1
+  current="$("$CORE_LINK" -version 2>/dev/null | awk 'NR==1 {print $2}')" || current=''
+  if version_at_least "$current" "$REALITY_MIN_XRAY_VERSION"; then return 0; fi
+  info "当前 Xray ${current:-版本未知} 未达到 Reality 已验证版本 $REALITY_MIN_XRAY_VERSION，正在升级至 $DEFAULT_XRAY_VERSION。"
+  switch_version "$DEFAULT_XRAY_VERSION"
+}
+
 apply_config() {
   local candidate="$1" backup old_active=0
   need_core
@@ -812,7 +842,7 @@ next_node_name() {
 
 add_node() {
   init_config || return 1
-  local name method='' default_name protocol endpoint sni="$DEFAULT_REALITY_SERVER"
+  local name method='' default_name protocol endpoint sni=''
   ui_title '自定义创建节点'
   protocol="$(choose_protocol)" || return 1
   default_name="$(next_node_name)" || return 1
@@ -841,7 +871,7 @@ quick_add_node() {
   endpoint="$(choose_connection_setup auto)" || return 1
   case "$protocol" in ss) method="$DEFAULT_SS_METHOD" ;; ss2022) method="$DEFAULT_SS2022_METHOD" ;; esac
   ensure_core_for_new_node || return 1
-  create_selected_node "$protocol" "$name" "$method" "$endpoint" "$DEFAULT_REALITY_SERVER"
+  create_selected_node "$protocol" "$name" "$method" "$endpoint" ''
 }
 
 choose_protocol() {
@@ -866,10 +896,26 @@ choose_protocol() {
 choose_reality_server() {
   local host
   say 'Reality 伪装站点需支持 TLS 1.3，并能从服务器访问；它与节点的 DDNS 域名是两个地址。' >&2
-  read -r -p "Reality 伪装域名（回车使用 $DEFAULT_REALITY_SERVER）：" host || return 1
-  host="${host:-$DEFAULT_REALITY_SERVER}"
-  valid_domain "$host" || { fail '请输入有效的伪装域名。'; return 1; }
+  read -r -p 'Reality 伪装域名（回车从已测试的非 Cloudflare 候选池随机选择）：' host || return 1
+  if [[ -n "$host" ]]; then
+    valid_domain "$host" || { fail '请输入有效的伪装域名。'; return 1; }
+  fi
   printf '%s\n' "$host"
+}
+
+# Fisher-Yates 洗牌；完整输出后才开始测试，随机源失败时不退回固定域名。
+random_reality_servers() {
+  local -a servers=("${REALITY_SERVERS[@]}")
+  local i j random_hex swapped
+  ((${#servers[@]})) || { fail 'Reality 候选域名池为空。'; return 1; }
+  for ((i=${#servers[@]}-1; i>0; i--)); do
+    random_hex="$(openssl rand -hex 4)" || return 1
+    j=$((16#$random_hex % (i+1)))
+    swapped="${servers[i]}"
+    servers[i]="${servers[j]}"
+    servers[j]="$swapped"
+  done
+  printf '%s\n' "${servers[@]}"
 }
 
 choose_connection_setup() {
@@ -1016,11 +1062,15 @@ read_reality_key() {
 
 create_reality_node() {
   local name="$1" port="$2" host="$3" meta="$4" sni="$5"
-  local tag="vless-$name" keys private public uuid sid node listen
-  info "检查 Reality 伪装站点 $sni:443 的 TLS 1.3 连接……"
-  if ! probe_reality_target "$sni"; then
-    fail "当前服务器无法通过 TLS 1.3 访问伪装站点 $sni:443，未创建节点。请检查出站网络，或在自定义创建中更换伪装域名。"
-    return 1
+  local tag="vless-$name" keys private public uuid sid node listen candidates result
+  local -a servers=()
+  ensure_reality_core || return 1
+  if [[ -z "$sni" ]]; then
+    candidates="$(random_reality_servers)" || return 1
+    while IFS= read -r sni; do servers+=("$sni"); done <<< "$candidates"
+    info "已随机排列 ${#servers[@]} 个非 Cloudflare 伪装站点，将使用首个实测通过的目标。"
+  else
+    servers=("$sni")
   fi
   # 同时捕获两个输出通道，失败时也不将可能含私钥的原始输出显示到终端。
   keys="$("$CORE_LINK" x25519 2>&1)" || { fail 'Xray 密钥命令执行失败，请在高级设置中检查或切换内核版本。'; return 1; }
@@ -1033,13 +1083,29 @@ create_reality_node() {
   [[ "$uuid" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || { fail '内核未生成有效 UUID。'; return 1; }
   sid="$(openssl rand -hex 8)" || return 1
   listen="$(node_listen_address)"
-  node="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg private "$private" \
-    --arg sni "$sni" --arg sid "$sid" --arg listen "$listen" '{tag:$tag,listen:$listen,port:$port,protocol:"vless",
-    settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},
-    streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,
-      serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}')" || return 1
   meta="$(jq --arg key "$public" '.reality_public_key=$key' <<< "$meta")" || return 1
-  commit_new_node "$tag" "$node" "$host" "$meta"
+  for sni in "${servers[@]}"; do
+    info "检查 Reality 伪装站点 $sni:443 的 TLS 1.3 连接……"
+    if ! probe_reality_target "$sni"; then
+      warn "伪装站点 $sni 的 TLS 1.3 访问未通过。"
+      continue
+    fi
+    node="$(jq -n --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg private "$private" \
+      --arg sni "$sni" --arg sid "$sid" --arg listen "$listen" '{tag:$tag,listen:$listen,port:$port,protocol:"vless",
+      settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:"none"},
+      streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,
+        serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}')" || return 1
+    if commit_new_node "$tag" "$node" "$host" "$meta"; then
+      return 0
+    else
+      result=$?
+    fi
+    # 只有隧道自检失败可换站点；保存配置或启用服务失败时立即停止。
+    [[ "$result" == 2 ]] || return "$result"
+    warn "伪装站点 $sni 的 Reality + Vision 实测未通过。"
+  done
+  fail '本次伪装站点均未通过连接测试，未创建节点。请检查出站网络，或在自定义创建中指定其他域名。'
+  return 1
 }
 
 commit_new_node() {
@@ -1049,6 +1115,16 @@ commit_new_node() {
   jq --argjson node "$node" '.inbounds += [$node]' "$CONFIG" > "$tmp" || { rm -f "$tmp"; return 1; }
   if ! save_node_host "$tag" "$host"; then rm -f "$tmp"; return 1; fi
   if ! save_node_meta "$tag" "$meta"; then remove_node_host "$tag"; rm -f "$tmp"; return 1; fi
+  if [[ "$tag" == vless-* ]]; then
+    info '正在用临时实例验证 Reality + Vision 握手和 HTTPS 代理请求……'
+    if ! CONFIG="$tmp" probe_reality_connection "$tag" isolated; then
+      remove_node_host "$tag" || warn '自检失败，节点地址记录未能清理。'
+      rm -f "$tmp"
+      warn 'Reality 实际连接自检失败，未创建节点。普通 TLS 1.3 可访问不代表兼容 Reality。'
+      return 2
+    fi
+    info 'Reality + Vision 握手和 HTTPS 代理请求通过。'
+  fi
   if ! apply_config "$tmp"; then
     remove_node_host "$tag" || warn '服务创建失败，节点地址记录未能清理。'
     return 1
@@ -1906,6 +1982,10 @@ print_reality_probe_errors() {
     warn '无法安全提取诊断日志，已隐藏原始错误内容。'
     return 0
   fi
+  if [[ -f "$probe_dir/server.json" && -s "$probe_dir/server.log" ]] &&
+     awk '/len\(s2cSaved\):/ && /[[:space:]](Server Hello|Change Cipher Spec|Encrypted Extensions|Certificate|Certificate Verify|Finished|New Session Ticket): [0-9]+$/ && ($NF+0)>8192 {found=1} END {exit !found}' "$probe_dir/server.log"; then
+    warn '检测到超过 8192 字节的 TLS 握手记录；旧 Xray v26.6.1 会因此中断连接，运行 xnode install-default 可升级。已验证的 v26.10.10 能处理本次 8273 字节记录；若已升级，请结合后续错误判断。'
+  fi
   for kind in curl client server check; do
     [[ -s "$probe_dir/$kind.log" ]] || continue
     case "$kind" in
@@ -1991,8 +2071,9 @@ probe_reality_connection() (
     warn 'Reality 自检客户端未能建立本机代理监听。'
     print_reality_probe_errors "$probe_dir" "$started"; return 1
   fi
+  # Reality 启动时的目标探测约需 5 秒，临时实例的连接超时必须留出余量。
   if tls_result="$(curl --silent --show-error --noproxy '' --proxy "socks5h://127.0.0.1:$proxy_port" \
-    --connect-timeout 5 --max-time 15 --tlsv1.3 --tls-max 1.3 --head --output /dev/null \
+    --connect-timeout 15 --max-time 25 --tlsv1.3 --tls-max 1.3 --head --output /dev/null \
     --write-out '%{ssl_verify_result} %{time_appconnect}' "https://$sni/" 2> "$probe_dir/curl.log")"; then
     return 0
   else
@@ -2302,7 +2383,7 @@ Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality）
       sudo xnode diagnose      # 诊断 Reality：服务 / 端口 / 密钥 / 伪装站点
       sudo xnode ddns          # 配置 DDNS 自动更新
       sudo xnode ddns-update   # 立即更新一次 DDNS
-      sudo xnode install-default   # 安装默认 Xray 内核版本 v26.6.1
+      sudo xnode install-default   # 安装默认 Xray 内核版本 v26.10.10
       bash xray-ss.sh check # 检测系统兼容性（无须 root）
 支持多种 Linux 发行版；服务管理方式：systemd / OpenRC / SysVinit / runit / procd / 手动。
 支持的 CPU 架构取决于 Xray 官方发布包；不支持的架构会在安装前提示。
