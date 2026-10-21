@@ -83,6 +83,12 @@ Cloudflare Token 需授权相应域名的**区域读取**和 **DNS 编辑**权�
 
 名称支持中文，回车自动命名；快速创建和自定义创建都支持三种协议。Reality 默认使用 `www.microsoft.com:443` 作为伪装站点，自定义时可以修改为服务器可访问、支持 TLS 1.3 的站点。**Reality 伪装域名与客户端连接的 DDNS 域名是两个地址**：连接地址可以是 IP、自己的域名或 DDNS，不需要为其申请 TLS 证书。
 
+创建 Reality 前会检查服务器能否直接与伪装站点完成 TLS 1.3 访问；失败时停止创建，请检查服务器出站网络，或在自定义创建中更换伪装域名。
+
+**Reality 创建后不能连接：** 运行 `sudo xnode diagnose`，或在主菜单 **5 → 4** 诊断。它会检查内核配置、服务、本机 TCP 监听、分享公钥与服务端私钥是否一致，以及伪装站点的 TLS 1.3 访问；输出不包含 UUID、密钥和分享链接。只检查一个节点可使用 `sudo xnode diagnose 节点名称`。
+
+本机检查通过后，仍需从客户端验证公网连接：**SS 和 Reality 使用不同端口时，要分别放行**；NAT 必须将 Reality 的公网 TCP 端口映射到对应本机端口。客户端需支持 Reality 和 Vision，并使用最新分享链接；请保留握手报错以便进一步排查。
+
 主菜单 **4** 选择节点后：
 
 | 选项 | 功能 |
@@ -128,6 +134,7 @@ xnode list             # 查看序号、本机端口、公网端口、协议
 xnode show             # 选择节点，查看连接信息或出站 JSON
 xnode status           # 查看服务状态
 xnode logs             # 查看运行日志
+xnode diagnose         # 检查 Reality 配置、密钥、监听和伪装站点
 xnode ddns             # 配置 / 管理 DDNS 自动更新
 xnode ddns-update      # 立即更新 DDNS
 xnode install-default  # 安装 / 切换到默认 Xray v26.6.1

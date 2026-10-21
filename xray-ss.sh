@@ -972,6 +972,26 @@ node_listen_address() {
   fi
 }
 
+probe_reality_target() {
+  local sni="$1" target="${2:-$1:443}" dial_host port host tls_result
+  valid_domain "$sni" || return 1
+  [[ "$target" == *:* ]] || return 1
+  dial_host="${target%:*}"
+  port="$(normalize_port "${target##*:}")" || return 1
+  host="${dial_host#[}"; host="${host%]}"
+  valid_share_host "$host" || return 1
+  if [[ "$host" == *:* ]]; then dial_host="[$host]"; else dial_host="$host"; fi
+  # 使用与 Xray 相同的直连路径；HTTP 301/403 等响应也说明 TLS 握手已完成。
+  # 不跟随跳转，避免把跳转后其他站点的握手误当成目标站点的结果。
+  if tls_result="$(curl --silent --show-error --noproxy '*' --connect-timeout 5 --max-time 10 \
+    --tlsv1.3 --tls-max 1.3 --connect-to "$sni:443:$dial_host:$port" \
+    --head --output /dev/null --write-out '%{ssl_verify_result} %{time_appconnect}' "https://$sni/" 2>/dev/null)"; then
+    return 0
+  fi
+  # TLS 已完成且证书校验通过时，后续的 HTTP 空响应/超时不影响 Reality 目标判断。
+  awk 'NF==2 && $1=="0" && $2 ~ /^[0-9]+[.][0-9]+$/ && ($2+0)>0 {ok=1} END {exit !ok}' <<< "$tls_result"
+}
+
 # Xray 不同版本使用 Public key、PublicKey、Password 或 Password (PublicKey)。
 # 只按明确的密钥标签读取；Hash32 是哈希，不能用作客户端公钥。
 read_reality_key() {
@@ -997,6 +1017,11 @@ read_reality_key() {
 create_reality_node() {
   local name="$1" port="$2" host="$3" meta="$4" sni="$5"
   local tag="vless-$name" keys private public uuid sid node listen
+  info "检查 Reality 伪装站点 $sni:443 的 TLS 1.3 连接……"
+  if ! probe_reality_target "$sni"; then
+    fail "当前服务器无法通过 TLS 1.3 访问伪装站点 $sni:443，未创建节点。请检查出站网络，或在自定义创建中更换伪装域名。"
+    return 1
+  fi
   # 同时捕获两个输出通道，失败时也不将可能含私钥的原始输出显示到终端。
   keys="$("$CORE_LINK" x25519 2>&1)" || { fail 'Xray 密钥命令执行失败，请在高级设置中检查或切换内核版本。'; return 1; }
   if ! private="$(read_reality_key private <<< "$keys")" ||
@@ -1041,6 +1066,7 @@ commit_new_node() {
   fi
   if show_node_connection "$tag"; then
     say '下一步：复制上面的完整链接，在客户端选择“从剪贴板导入”。'
+    if [[ "$tag" == vless-* ]]; then say 'Reality 无法连接时，运行 sudo xnode diagnose 检查原因。'; fi
   else
     warn '节点已创建，但连接信息显示失败。可在主菜单 2 中重新查看。'
   fi
@@ -1814,6 +1840,76 @@ view_node_connections() {
   done
 }
 
+tcp_port_is_listening() {
+  local port="$1" sockets
+  if command -v ss >/dev/null 2>&1; then
+    sockets="$(ss -H -ltn 2>/dev/null)" || return 2
+  elif command -v netstat >/dev/null 2>&1; then
+    sockets="$(netstat -lnt 2>/dev/null)" || return 2
+  else
+    return 2
+  fi
+  awk -v port="$port" '$4 ~ (":" port "$") {found=1} END {exit !found}' <<< "$sockets"
+}
+
+diagnose_reality_nodes() {
+  need_core || return 1
+  [[ -f "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
+  local tag node port public_port host sni target private output derived cached state failed=0
+  local -a tags=()
+  if [[ -n "${1:-}" ]]; then
+    tag="$(resolve_node_tag "$1")" || return 1
+    tags=("$tag")
+  else
+    while IFS= read -r tag; do tags+=("$tag"); done < <(jq -r '.inbounds[]?|select(.protocol=="vless" and .streamSettings.security=="reality")|.tag' "$CONFIG" 2>/dev/null)
+  fi
+  ((${#tags[@]})) || { say '当前没有 VLESS + Reality 节点。'; return 0; }
+  ui_title 'Reality 连接诊断（不显示 UUID、密钥或分享链接）'
+  printf '  内核：'; "$CORE_LINK" -version 2>/dev/null | awk 'NR==1 {print; exit}' || true
+  if ! "$CORE_LINK" run -test -format json -config "$CONFIG" >/dev/null 2>&1; then
+    fail '内核配置校验失败，请先通过服务管理查看本机运行日志。'
+    return 1
+  fi
+  info '内核配置校验通过。'
+  if service_is_active; then info 'Xray 服务正在运行。'
+  else warn 'Xray 服务未运行，请先在服务管理中启动服务。'; failed=1; fi
+  for tag in "${tags[@]}"; do
+    ui_section "节点：$(visible_node_name "$tag")"
+    node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t and .protocol=="vless" and .streamSettings.security=="reality")' "$CONFIG" 2>/dev/null)" || {
+      warn '此节点不是 VLESS + Reality 节点。'; failed=1; continue;
+    }
+    port="$(jq -er .port <<< "$node")" || { failed=1; continue; }
+    public_port="$(node_public_port "$tag")" || { failed=1; continue; }
+    host="$(node_share_host "$tag")" || { failed=1; continue; }
+    say "  公网入口：$host:$public_port → 本机 TCP $port"
+    sni="$(jq -r '.streamSettings.realitySettings.serverNames[0] // empty' <<< "$node")"
+    target="$(jq -r '.streamSettings.realitySettings.target // .streamSettings.realitySettings.dest // empty' <<< "$node")"
+    private="$(jq -r '.streamSettings.realitySettings.privateKey // empty' <<< "$node")"
+    cached=''
+    if [[ -f "$NODE_META_FILE" ]]; then
+      cached="$(jq -r --arg t "$tag" '.[$t].reality_public_key // empty' "$NODE_META_FILE" 2>/dev/null)" || cached=''
+    fi
+    if [[ "$private" =~ ^[a-zA-Z0-9_-]{43}$ ]] &&
+       output="$("$CORE_LINK" x25519 -i "$private" 2>&1)" && derived="$(read_reality_key public <<< "$output")"; then
+      if [[ -n "$cached" && "$cached" != "$derived" ]]; then
+        warn '分享链接公钥记录与服务端私钥不匹配，客户端无法用这份链接完成认证。'; failed=1
+      else info 'Reality 密钥一致。'; fi
+    else warn '无法从服务端私钥计算公钥，请检查内核版本和私钥格式。'; failed=1; fi
+    if tcp_port_is_listening "$port"; then info "本机 TCP $port 已监听。"
+    else
+      state=$?
+      if [[ "$state" == 2 ]]; then warn '无法读取监听状态，请检查 ss（iproute2）或 netstat 是否可用，以及运行权限。'
+      else warn "本机 TCP $port 未监听，请检查服务日志或重启服务。"; fi
+      failed=1
+    fi
+    if probe_reality_target "$sni" "$target"; then info "伪装站点 $target 的 TLS 1.3 访问通过（SNI：$sni）。"
+    else warn "伪装站点 $target 的 TLS 1.3 访问失败（SNI：$sni），请检查出站网络或更换伪装域名。"; failed=1; fi
+    say "  公网入站需要从客户端验证：确认 TCP $public_port 已放行；NAT 需转发到本机 $port。"
+  done
+  if ((failed)); then warn '诊断发现未通过的检查，请按上面的提示处理后重试。'; return 1; fi
+  info '本机检查通过。请用客户端重试，并结合客户端握手报错确认公网连接。'
+}
+
 status() {
   if [[ -x "$CORE_LINK" ]]; then
     printf 'Xray 内核：'; "$CORE_LINK" -version 2>/dev/null | head -n 1 || true
@@ -1942,15 +2038,17 @@ service_menu() {
     ui_item 1 '查看服务运行状态'
     ui_item 2 '重启 / 启动 Xray 服务'
     ui_item 3 '查看运行日志'
+    ui_item 4 '诊断 Reality 连接问题'
     ui_back '返回主菜单'
-    read -r -p '请选择 [1-3 / 0]：' ans || return 0
+    read -r -p '请选择 [1-4 / 0]：' ans || return 0
     case "$ans" in
       1) status || true ;;
       2) restart_xray || true ;;
       3) logs || true ;;
+      4) diagnose_reality_nodes || true ;;
       0) return 0 ;;
       '') continue ;;
-      *) warn '请输入 1～3，或输入 0 返回。' ;;
+      *) warn '请输入 1～4，或输入 0 返回。' ;;
     esac
   done
 }
@@ -2031,6 +2129,7 @@ Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality）
       sudo xnode show          # 选择节点，查看分享链接或出站 JSON
       sudo xnode status        # 查看服务状态
       sudo xnode logs          # 查看运行日志
+      sudo xnode diagnose      # 诊断 Reality：服务 / 端口 / 密钥 / 伪装站点
       sudo xnode ddns          # 配置 DDNS 自动更新
       sudo xnode ddns-update   # 立即更新一次 DDNS
       sudo xnode install-default   # 安装默认 Xray 内核版本 v26.6.1
@@ -2071,6 +2170,11 @@ main() {
     --help|-h|help) usage; return 0 ;;
     check) check_compatibility; return $? ;;
     ddns-update) require_root || return 1; ddns_update; return $? ;;
+    diagnose)
+      require_root || return 1
+      detect_init_system || return 1
+      diagnose_reality_nodes "${2:-}"
+      return $? ;;
   esac
   require_root
   need_env
