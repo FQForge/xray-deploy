@@ -6,7 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 SCRIPT="$SCRIPT_DIR/xray-ss.sh"
 if [ ! -f "$SCRIPT" ]; then
   printf '%s\n' "未找到 xray-ss.sh，请将 install.sh 和 xray-ss.sh 放在同一目录。" >&2

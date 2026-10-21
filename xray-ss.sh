@@ -5,7 +5,6 @@
 set -Eeuo pipefail
 umask 077
 
-APP=xray-ss
 SERVICE_NAME=xray-ss
 SERVICE=xray-ss.service
 ETC_DIR="${XSS_ETC_DIR:-/etc/xray-ss}"
@@ -46,7 +45,6 @@ REALITY_SERVERS=(
 )
 DISTRO_ID=unknown
 DISTRO_NAME=unknown
-DISTRO_ID_LIKE=''
 PKG_MANAGER=''
 INIT_SYSTEM=''
 XRAY_ARCH=''
@@ -85,7 +83,6 @@ detect_distribution() {
     . /etc/os-release
     DISTRO_ID="${ID:-unknown}"
     DISTRO_NAME="${PRETTY_NAME:-${NAME:-$DISTRO_ID}}"
-    DISTRO_ID_LIKE="${ID_LIKE:-}"
   fi
 }
 
@@ -134,7 +131,8 @@ detect_init_system() {
       *) fail "XSS_INIT_SYSTEM 值无效：$XSS_INIT_SYSTEM"; return 1 ;;
     esac
   fi
-  pid1="$(ps -p 1 -o comm= 2>/dev/null | tr -d '[:space:]' || true)"
+  # BusyBox ps 不一定支持 -p/-o，直接读取 /proc 进程信息。
+  if [[ -r /proc/1/comm ]]; then IFS= read -r pid1 < /proc/1/comm || true; fi
   if [[ "$pid1" == procd ]] || { [[ -r /etc/openwrt_release ]] && command -v ubus >/dev/null 2>&1 && [[ -x /etc/rc.common ]]; }; then
     INIT_SYSTEM=procd
   elif [[ "$pid1" == systemd || -d /run/systemd/system ]]; then
@@ -175,14 +173,19 @@ install_missing_dependencies() {
     apt)
       apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends bash curl jq unzip openssl ca-certificates coreutils || { fail '依赖安装失败。请检查可用的软件源和网络后重试。'; return 1; }
       ;;
-    dnf)
-      dnf install -y bash curl jq unzip openssl ca-certificates coreutils || { fail '依赖安装失败。请检查可用的软件源和网络后重试。'; return 1; }
-      ;;
-    microdnf)
-      microdnf install -y bash curl jq unzip openssl ca-certificates coreutils || { fail '依赖安装失败。请检查可用的软件源和网络后重试。'; return 1; }
-      ;;
-    yum)
-      yum install -y bash curl jq unzip openssl ca-certificates coreutils || { fail '依赖安装失败。请检查可用的软件源和网络后重试。'; return 1; }
+    dnf|microdnf|yum)
+      # Rocky / Alma / Fedora 精简镜像可能已提供 curl-minimal、coreutils-single。
+      # 只补缺失命令，避免强装完整版触发包冲突。
+      local -a rpm_packages=(ca-certificates)
+      local rpm_coreutils=0
+      for cmd in "${missing[@]}"; do
+        case "$cmd" in
+          sha256sum|base64) rpm_coreutils=1 ;;
+          *) rpm_packages+=("$cmd") ;;
+        esac
+      done
+      if ((rpm_coreutils)); then rpm_packages+=(coreutils); fi
+      "$PKG_MANAGER" install -y "${rpm_packages[@]}" || { fail '依赖安装失败。请检查可用的软件源和网络后重试。'; return 1; }
       ;;
     zypper)
       zypper --non-interactive install --no-recommends bash curl jq unzip openssl ca-certificates coreutils || { fail '依赖安装失败。请检查可用的软件源和网络后重试。'; return 1; }
@@ -679,6 +682,7 @@ port_in_use() {
   if [[ -f "$CONFIG" ]] && jq -e --argjson p "$port" '.inbounds[]? | select(.port==$p)' "$CONFIG" >/dev/null; then return 0; fi
   if command -v ss >/dev/null && ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${port}$"; then return 0; fi
   if command -v netstat >/dev/null && netstat -lntu 2>/dev/null | awk 'NR>2 {print $4}' | grep -Eq "(^|:)${port}$"; then return 0; fi
+  if proc_port_in_use "$port" all; then return 0; fi
   return 1
 }
 
@@ -1251,7 +1255,7 @@ delete_node() {
   need_core || return 1
   local tag="${1:-}" tmp yes
   if [[ -z "$tag" ]]; then tag="$(choose_node)" || return 1; fi
-  read -r -p "将删除节点 $(visible_node_name "$tag")，请输入“确认删除”以继续：" yes || return 2
+  read -r -p "将删除节点 $(visible_node_name "$tag")，请输入 '确认删除' 以继续：" yes || return 2
   [[ "$yes" == "确认删除" ]] || { info '已取消删除。'; return 2; }
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")"
   jq --arg t "$tag" '.inbounds |= map(select(.tag!=$t))' "$CONFIG" > "$tmp"
@@ -1618,7 +1622,7 @@ choose_node_host() {
         warn '无法自动获取公网 IP，请手动输入服务器的公网 IPv4 或 IPv6。' >&2
         read -r -p '请输入公网 IP（IPv4 或 IPv6，直接回车取消创建）：' host || return 1
         # 兼容粘贴带方括号的 IPv6 地址（如 [2001:db8::1]）。
-        if [[ "$host" == \[*\] ]]; then
+        if [[ "$host" == '['*']' ]]; then
           host="${host#[}"
           host="${host%]}"
         fi
@@ -1916,16 +1920,38 @@ view_node_connections() {
   done
 }
 
+# 精简系统可能既没有 iproute2，也没有 net-tools；从内核端口表查询。
+# 返回 0 表示占用，1 表示空闲，2 表示无法读取端口表。
+proc_port_in_use() {
+  local port hex mode="${2:-tcp}" path
+  local -a tables=()
+  port="$(normalize_port "$1")" || return 2
+  printf -v hex '%04X' "$port"
+  for path in /proc/net/tcp /proc/net/tcp6; do
+    [[ ! -r "$path" ]] || tables+=("$path")
+  done
+  if [[ "$mode" == all ]]; then
+    for path in /proc/net/udp /proc/net/udp6; do
+      [[ ! -r "$path" ]] || tables+=("$path")
+    done
+  fi
+  ((${#tables[@]})) || return 2
+  awk -v port="$hex" -v mode="$mode" '
+    toupper($2) ~ (":" port "$") && (mode=="all" || $4=="0A") {found=1}
+    END {exit !found}' "${tables[@]}"
+}
+
 tcp_port_is_listening() {
   local port="$1" sockets
-  if command -v ss >/dev/null 2>&1; then
-    sockets="$(ss -H -ltn 2>/dev/null)" || return 2
-  elif command -v netstat >/dev/null 2>&1; then
-    sockets="$(netstat -lnt 2>/dev/null)" || return 2
-  else
-    return 2
+  if command -v ss >/dev/null 2>&1 && sockets="$(ss -H -ltn 2>/dev/null)"; then
+    awk -v port="$port" '$4 ~ (":" port "$") {found=1} END {exit !found}' <<< "$sockets"
+    return $?
   fi
-  awk -v port="$port" '$4 ~ (":" port "$") {found=1} END {exit !found}' <<< "$sockets"
+  if command -v netstat >/dev/null 2>&1 && sockets="$(netstat -lnt 2>/dev/null)"; then
+    awk -v port="$port" '$4 ~ (":" port "$") {found=1} END {exit !found}' <<< "$sockets"
+    return $?
+  fi
+  proc_port_in_use "$port" tcp
 }
 
 # 自检沿用实际导出的客户端参数，连接本机入站；NAT 公网地址不参与回环测试。
@@ -2135,7 +2161,7 @@ diagnose_reality_nodes() {
     if tcp_port_is_listening "$port"; then info "本机 TCP $port 已监听。"
     else
       state=$?
-      if [[ "$state" == 2 ]]; then warn '无法读取监听状态，请检查 ss（iproute2）或 netstat 是否可用，以及运行权限。'
+      if [[ "$state" == 2 ]]; then warn '无法读取监听状态，请检查 /proc/net 的访问权限，或安装 iproute2 / net-tools。'
       else warn "本机 TCP $port 未监听，请检查服务日志或重启服务。"; fi
       failed=1; node_ready=0
     fi
