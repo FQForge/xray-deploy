@@ -1852,10 +1852,71 @@ tcp_port_is_listening() {
   awk -v port="$port" '$4 ~ (":" port "$") {found=1} END {exit !found}' <<< "$sockets"
 }
 
+# 自检沿用实际导出的客户端参数，连接本机入站；NAT 公网地址不参与回环测试。
+make_reality_probe_config() {
+  local tag="$1" proxy_port node outbound address port
+  proxy_port="$(normalize_port "$2")" || return 1
+  node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CONFIG")" || return 1
+  outbound="$(make_node_outbound_json "$tag")" || return 1
+  jq -e '.protocol=="vless" and .streamSettings.security=="reality"' <<< "$outbound" >/dev/null || return 1
+  address="$(jq -r '.listen // "0.0.0.0"' <<< "$node")"
+  case "$address" in
+    '::') address='::1' ;;
+    '0.0.0.0'|'*') address='127.0.0.1' ;;
+  esac
+  port="$(jq -er .port <<< "$node")" || return 1
+  jq -n --argjson outbound "$outbound" --arg address "$address" --argjson port "$port" --argjson proxy_port "$proxy_port" '
+    {log:{loglevel:"warning"},
+     inbounds:[{tag:"reality-probe-in",listen:"127.0.0.1",port:$proxy_port,protocol:"socks",
+       settings:{auth:"noauth",udp:false}}],
+     outbounds:[($outbound | .tag="reality-probe-out" | .mux={enabled:false} |
+       .settings.vnext[0].address=$address | .settings.vnext[0].port=$port)]}'
+}
+
+# 临时启动一个仅监听本机的客户端，让 HTTPS 请求实际通过 Reality + Vision。
+# 配置和日志只存放在私有临时目录，结束时停止客户端并删除临时凭据。
+probe_reality_connection() (
+  local tag="$1" proxy_port probe_dir probe_pid='' ready=0 tries sni tls_result curl_status
+  proxy_port="$(choose_port auto)" || { fail '无法为 Reality 自检找到空闲本机端口。'; return 1; }
+  probe_dir="$(mktemp -d)" || { fail '无法创建 Reality 自检临时目录。'; return 1; }
+  trap 'if [[ -n "${probe_pid:-}" ]]; then kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; fi; rm -rf "$probe_dir"' EXIT
+  trap 'exit 1' HUP INT TERM
+  if ! make_reality_probe_config "$tag" "$proxy_port" > "$probe_dir/client.json"; then
+    fail '无法生成 Reality 自检客户端配置。'; return 1
+  fi
+  sni="$(jq -er '.outbounds[0].streamSettings.realitySettings.serverName' "$probe_dir/client.json")" || return 1
+  valid_domain "$sni" || { fail 'Reality 自检的伪装域名无效。'; return 1; }
+  if ! "$CORE_LINK" run -test -format json -config "$probe_dir/client.json" > "$probe_dir/check.log" 2>&1; then
+    fail '当前内核不接受导出的 Reality 客户端配置。'; return 1
+  fi
+  "$CORE_LINK" run -format json -config "$probe_dir/client.json" > "$probe_dir/client.log" 2>&1 &
+  probe_pid=$!
+  for ((tries=0; tries<30; tries++)); do
+    if ! kill -0 "$probe_pid" 2>/dev/null; then
+      fail 'Reality 自检客户端启动失败，请检查本机权限和可用内存。'; return 1
+    fi
+    if tcp_port_is_listening "$proxy_port"; then ready=1; break; fi
+    sleep 0.1
+  done
+  if ((!ready)); then fail 'Reality 自检客户端未能建立本机代理监听。'; return 1; fi
+  if tls_result="$(curl --silent --show-error --noproxy '' --proxy "socks5h://127.0.0.1:$proxy_port" \
+    --connect-timeout 5 --max-time 15 --tlsv1.3 --tls-max 1.3 --head --output /dev/null \
+    --write-out '%{ssl_verify_result} %{time_appconnect}' "https://$sni/" 2>/dev/null)"; then
+    return 0
+  else
+    curl_status=$?
+  fi
+  # 有效 HTTPS 握手也能证明请求已通过隧道，后续 HTTP 空响应不影响此结论。
+  if awk 'NF==2 && $1=="0" && $2 ~ /^[0-9]+[.][0-9]+$/ && ($2+0)>0 {ok=1} END {exit !ok}' <<< "$tls_result"; then
+    return 0
+  fi
+  fail "本机 Reality 隧道请求失败（curl 状态 $curl_status）。请查看 Xray 服务日志中的握手或出站错误。"
+)
+
 diagnose_reality_nodes() {
   need_core || return 1
   [[ -f "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
-  local tag node port public_port host sni target private output derived cached state failed=0
+  local tag node port public_port host sni target private output derived cached state failed=0 active=1 node_ready
   local -a tags=()
   if [[ -n "${1:-}" ]]; then
     tag="$(resolve_node_tag "$1")" || return 1
@@ -1872,8 +1933,9 @@ diagnose_reality_nodes() {
   fi
   info '内核配置校验通过。'
   if service_is_active; then info 'Xray 服务正在运行。'
-  else warn 'Xray 服务未运行，请先在服务管理中启动服务。'; failed=1; fi
+  else warn 'Xray 服务未运行，请先在服务管理中启动服务。'; failed=1; active=0; fi
   for tag in "${tags[@]}"; do
+    node_ready=$active
     ui_section "节点：$(visible_node_name "$tag")"
     node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t and .protocol=="vless" and .streamSettings.security=="reality")' "$CONFIG" 2>/dev/null)" || {
       warn '此节点不是 VLESS + Reality 节点。'; failed=1; continue;
@@ -1892,18 +1954,24 @@ diagnose_reality_nodes() {
     if [[ "$private" =~ ^[a-zA-Z0-9_-]{43}$ ]] &&
        output="$("$CORE_LINK" x25519 -i "$private" 2>&1)" && derived="$(read_reality_key public <<< "$output")"; then
       if [[ -n "$cached" && "$cached" != "$derived" ]]; then
-        warn '分享链接公钥记录与服务端私钥不匹配，客户端无法用这份链接完成认证。'; failed=1
+        warn '分享链接公钥记录与服务端私钥不匹配，客户端无法用这份链接完成认证。'; failed=1; node_ready=0
       else info 'Reality 密钥一致。'; fi
-    else warn '无法从服务端私钥计算公钥，请检查内核版本和私钥格式。'; failed=1; fi
+    else warn '无法从服务端私钥计算公钥，请检查内核版本和私钥格式。'; failed=1; node_ready=0; fi
     if tcp_port_is_listening "$port"; then info "本机 TCP $port 已监听。"
     else
       state=$?
       if [[ "$state" == 2 ]]; then warn '无法读取监听状态，请检查 ss（iproute2）或 netstat 是否可用，以及运行权限。'
       else warn "本机 TCP $port 未监听，请检查服务日志或重启服务。"; fi
-      failed=1
+      failed=1; node_ready=0
     fi
     if probe_reality_target "$sni" "$target"; then info "伪装站点 $target 的 TLS 1.3 访问通过（SNI：$sni）。"
-    else warn "伪装站点 $target 的 TLS 1.3 访问失败（SNI：$sni），请检查出站网络或更换伪装域名。"; failed=1; fi
+    else warn "伪装站点 $target 的 TLS 1.3 访问失败（SNI：$sni），请检查出站网络或更换伪装域名。"; failed=1; node_ready=0; fi
+    if ((node_ready)); then
+      info '正在通过本机 Reality + Vision 节点发起 HTTPS 请求……'
+      if probe_reality_connection "$tag"; then
+        info '本机 Reality 握手和代理请求通过。若客户端仍失败，请检查公网 TCP 入口及客户端配置。'
+      else failed=1; fi
+    fi
     say "  公网入站需要从客户端验证：确认 TCP $public_port 已放行；NAT 需转发到本机 $port。"
   done
   if ((failed)); then warn '诊断发现未通过的检查，请按上面的提示处理后重试。'; return 1; fi
