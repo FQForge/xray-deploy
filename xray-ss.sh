@@ -971,23 +971,11 @@ choose_connection_setup() {
   else
     port="$(choose_port auto)" || return 1
   fi
-  if [[ "$dynamic" == true ]]; then
-    if [[ "$nat" == true ]]; then
-      say '本机 DDNS 更新要求出口 IP 与入站映射 IP 相同；服务商入口/出口不同，请使用上游设备维护的已有 DDNS。' >&2
-    fi
-    host="$(choose_dynamic_host)" || return 1
-  elif [[ "$nat" == true ]]; then
-    while :; do
-      read -r -p '服务商/路由器的公网 IP 或域名（不是内网 IP，0 返回）：' host || return 1
-      [[ "$host" != 0 ]] || return 1
-      host="${host#[}"; host="${host%]}"
-      if valid_domain "$host" || valid_public_ip "$host"; then break; fi
-      warn '请输入有效的公网 IPv4、IPv6 或域名。'
-    done
-  elif [[ "$style" == custom || "$style" == address ]]; then
-    host="$(choose_node_host)" || return 1
-  else
-    host="$(choose_node_host auto)" || return 1
+  host="$(choose_node_host "$dynamic")" || return 1
+  if ! valid_domain "$host"; then
+    dynamic=false
+  elif [[ "$dynamic" == true && "$nat" == true ]]; then
+    say '本机 DDNS 更新要求出口 IP 与入站映射 IP 相同；服务商入口/出口不同，请使用上游设备维护的已有 DDNS。' >&2
   fi
   jq -n --arg host "$host" --argjson port "$port" --argjson nat "$nat" --argjson dynamic "$dynamic" \
     --arg public_port "$public_port" '{host:$host,port:$port,nat:$nat,dynamic:$dynamic} +
@@ -1354,19 +1342,29 @@ valid_public_ip() {
   else return 1; fi
 }
 
-# DDNS 凭据只保存在权限为 600 的 JSON 文件中，不作为 shell 代码加载。
+# 依次尝试多个公网 IP 查询源，避免单个服务不可用时中断自动获取。
 detect_public_ip() {
-  local family="${1:-4}" ip
-  if [[ "$family" == 6 ]]; then
-    ip="$(curl -6fsSL --connect-timeout 4 --max-time 8 https://api6.ipify.org 2>/dev/null)" || return 1
-    valid_ipv6 "$ip" || return 1
-  else
-    ip="$(curl -4fsSL --connect-timeout 4 --max-time 8 https://api.ipify.org 2>/dev/null)" || return 1
-    valid_ipv4 "$ip" || return 1
-  fi
-  printf '%s\n' "$ip"
+  local family="${1:-4}" ip url
+  local -a urls=()
+  case "$family" in
+    4) urls=(https://api.ipify.org https://ipv4.icanhazip.com https://v4.ident.me) ;;
+    6) urls=(https://api6.ipify.org https://ipv6.icanhazip.com https://v6.ident.me) ;;
+    *) return 1 ;;
+  esac
+  for url in "${urls[@]}"; do
+    # 绕过环境代理，避免把代理服务器的 IP 当成本机公网 IP。
+    ip="$(curl "-$family" -fsSL --noproxy '*' --connect-timeout 4 --max-time 8 "$url" 2>/dev/null)" || continue
+    ip="${ip//$'\r'/}"
+    valid_public_ip "$ip" || continue
+    if { [[ "$family" == 4 ]] && valid_ipv4 "$ip"; } || { [[ "$family" == 6 ]] && valid_ipv6 "$ip"; }; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  return 1
 }
 
+# DDNS 凭据只保存在权限为 600 的 JSON 文件中，不作为 shell 代码加载。
 cloudflare_api() {
   local token="$1" method="$2" path="$3" data="${4:-}" response
   local -a args=(-fsS --connect-timeout 6 --max-time 25 --config - -X "$method" -H 'Content-Type: application/json')
@@ -1517,9 +1515,11 @@ remove_ddns_scheduler() {
 }
 
 configure_ddns() {
-  local provider="$1" host token family cfg tmp
+  local provider="$1" host="${2:-}" token family cfg tmp
   init_config || return 1
-  read -r -p '你拥有的 DDNS 域名（例如 node.example.com 或 xxx.duckdns.org，0 返回）：' host || return 1
+  if [[ -z "$host" ]]; then
+    read -r -p '你拥有的 DDNS 域名（例如 node.example.com 或 xxx.duckdns.org，0 返回）：' host || return 1
+  fi
   [[ "$host" != 0 ]] || return 1
   host="${host,,}"
   valid_domain "$host" || { fail '域名格式无效。'; return 1; }
@@ -1552,9 +1552,11 @@ configure_ddns() {
 }
 
 choose_dynamic_host() {
-  local choice host saved=''
+  local choice host="$1" saved=''
+  valid_domain "$host" || { fail '请输入有效的 DDNS 域名。'; return 1; }
   if [[ -f "$DDNS_FILE" ]]; then saved="$(jq -r '.host // empty' "$DDNS_FILE")" || return 1; fi
   ui_title '动态 IP 使用 DDNS 域名' >&2
+  say "连接域名：$host" >&2
   ui_item 1 '使用已有 DDNS（路由器、ddns-go 等已负责更新）' >&2
   ui_item 2 '配置 Cloudflare 自动更新（需要自己的域名和 Token）' >&2
   ui_item 3 '配置 DuckDNS 自动更新（需要已申请的免费域名和 Token）' >&2
@@ -1562,15 +1564,12 @@ choose_dynamic_host() {
   read -r -p '请选择 DDNS 方式 [1-3，默认 1，0 返回]：' choice || return 1
   case "$choice" in
     1|'')
-      read -r -p "DDNS 域名${saved:+（回车沿用 $saved）}：" host || return 1
-      host="${host:-$saved}"
-      valid_domain "$host" || { fail '请输入已配置好的 DDNS 域名。'; return 1; }
       if [[ "$host" == "$saved" && -n "$saved" ]]; then info '沿用已配置的本机 DDNS 自动更新。' >&2
       else warn '请确保路由器或 DDNS 客户端持续更新此域名；只填写域名不会自动更新 DNS。'; fi
       ;;
     2|3)
-      if [[ "$choice" == 2 ]]; then configure_ddns cloudflare >&2 || return 1
-      else configure_ddns duckdns >&2 || return 1; fi
+      if [[ "$choice" == 2 ]]; then configure_ddns cloudflare "$host" >&2 || return 1
+      else configure_ddns duckdns "$host" >&2 || return 1; fi
       host="$(jq -er .host "$DDNS_FILE")" || return 1
       ;;
     *) return 1 ;;
@@ -1608,36 +1607,30 @@ detect_public_host() {
 }
 
 choose_node_host() {
-  local answer='' host
-  if [[ "${1:-}" != auto ]]; then
-    read -r -p '此节点是否使用域名（含 DDNS）作为连接地址？[y/N]：' answer || return 1
-  fi
+  local dynamic="${1:-false}" answer host=''
+  read -r -p '此节点是否使用域名（含 DDNS）作为连接地址？[y/N，回车自动获取本机公网 IP，0 返回]：' answer || return 1
   case "$answer" in
     y|Y|yes|YES|是)
-      read -r -p '请输入已解析到此 VPS 的域名（如 ss.example.com）：' host || return 1
-      if ! valid_domain "$host"; then
-        fail '域名格式不正确，请只输入域名，不要包含 http://、端口、路径或空格。'
-        return 1
-      fi
-      info "此节点将使用域名：$host" >&2
-      warn '请自行确认域名 DNS 已指向该服务器；这里只修改分享链接，不配置 DNS 或 TLS。' >&2
-      ;;
-    ''|n|N|no|NO|否)
-      if host="$(detect_public_host)"; then
-        info "已自动获取服务器公网 IP：$host" >&2
-      else
-        warn '无法自动获取公网 IP，请手动输入服务器的公网 IPv4 或 IPv6。' >&2
-        read -r -p '请输入公网 IP（IPv4 或 IPv6，直接回车取消创建）：' host || return 1
-        # 兼容粘贴带方括号的 IPv6 地址（如 [2001:db8::1]）。
-        if [[ "$host" == '['*']' ]]; then
-          host="${host#[}"
-          host="${host%]}"
+      read -r -p '节点连接域名（如 ss.example.com，回车自动获取本机公网 IP，0 返回）：' host || return 1
+      [[ "$host" != 0 ]] || return 1
+      if [[ -n "$host" ]]; then
+        valid_domain "$host" || { fail '域名格式不正确，请只输入域名，不要包含 http://、端口、路径或空格。'; return 1; }
+        if [[ "$dynamic" == true ]]; then
+          host="$(choose_dynamic_host "$host")" || return 1
+        else
+          info "此节点将使用域名：$host" >&2
+          warn '请自行确认域名 DNS 已指向该服务器；这里只修改分享链接，不配置 DNS 或 TLS。' >&2
         fi
-        (valid_ipv4 "$host" || valid_ipv6 "$host") || { fail '公网 IP 格式不正确。'; return 1; }
       fi
       ;;
-    *) fail '请选择 y 或 n（直接回车默认使用公网 IP）。'; return 1 ;;
+    ''|n|N|no|NO|否) ;;
+    0) return 1 ;;
+    *) fail '请选择 y 或 n（直接回车自动获取本机公网 IP，0 返回）。'; return 1 ;;
   esac
+  if [[ -z "$host" ]]; then
+    host="$(detect_public_host)" || { fail '无法自动获取本机公网 IP，请检查服务器出站网络后重试，或选择使用域名。'; return 1; }
+    info "已自动获取本机公网 IP：$host" >&2
+  fi
   printf '%s\n' "$host"
 }
 
