@@ -30,11 +30,11 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/FQForge/xray-deploy/main/i
 | 你的网络 | 创建时选择 | 需要准备 |
 | --- | --- | --- |
 | 普通公网 VPS | 1 · 独立公网 / 固定 IP | 通常直接回车即可 |
-| NAT 服务器 / 路由器端口映射 | 2 · NAT / 端口映射 | 已分配的公网地址、公网端口和本机端口 |
+| NAT 服务器 / 路由器端口映射 | 2 · NAT / 端口映射 | 已分配的公网地址和公网端口 |
 | IP 会变化 | 3 · 动态公网 IP + DDNS | 指向该服务器的 DDNS 域名 |
 | 同时是 NAT 和动态 IP | 4 · NAT + 动态 IP + DDNS | 端口映射信息和 DDNS 域名 |
 
-**NAT 示例：** 服务商给你 `nat.example.com:31415 → 本机 27001`，就填写公网地址 `nat.example.com`、公网端口 `31415`、本机端口 `27001`。脚本不会替你创建上游映射；没有分配入站端口的 NAT 不能直接连接。
+**NAT：** 创建时填写公网地址和已分配的公网端口，本机默认监听相同端口，不再额外询问。若上游映射使用不同的本机端口，创建后到 **管理节点 → 修改本机监听端口** 调整；修改已有节点的公网地址或映射时保留原本机端口。脚本不会替你创建上游映射；没有分配入站端口的 NAT 不能直接连接。
 
 **DDNS：** 可以使用已有 DDNS，也可在向导中配置 Cloudflare 或 DuckDNS 自动更新。Cloudflare Token 需有区域读取和 DNS 编辑权限，连接域名使用“仅 DNS”。非 systemd 系统需安装并启动 cron，才能每 5 分钟自动更新。
 
@@ -60,14 +60,16 @@ Reality 的伪装域名和自己的连接 / DDNS 域名是两个地址，按向�
 sudo xnode diagnose
 ```
 
-**更新工具：** 重新执行上面的安装命令，保留现有节点。旧版 Reality 无法使用时，更新后执行：
+**更新工具：** 重新执行上面的安装命令，保留现有节点。安装默认内核并诊断 Reality 可执行：
 
 ```bash
 sudo xnode install-default
 sudo xnode diagnose
 ```
 
-默认内核为 **v26.10.10**；新建 Reality 会自动升级低于该版本的旧内核。
+默认内核为 **v26.6.1**；首次创建自动安装该版本，创建 Reality 时也使用该版本作为最低版本，已安装的较新内核继续使用。安装包下载或 SHA256 校验失败时立即停止安装。
+
+v26.6.1 的 Reality 对较大的 TLS 握手记录存在兼容性限制。自动选择伪装站点时会逐个验证实际隧道，失败后尝试下一项；自定义域名未通过时，请更换域名重新创建，或在高级设置中手动选择兼容的较新官方内核。
 
 **备份：** 保存 `/etc/xray-ss`。**卸载：** 选择 **6 → 5**，按提示输入 `确认卸载`。
 
@@ -75,7 +77,9 @@ sudo xnode diagnose
 
 推荐使用 **Ubuntu 22.04 / 24.04 或 Debian 12 / 13**。脚本也适配 Alpine、Rocky / AlmaLinux / Fedora、openSUSE、Arch、Void、Gentoo 和 OpenWrt 的常见包管理与服务方式，但不能保证所有历史版本、定制固件和 CPU 都可用。
 
-本次验证包括 Ubuntu 22.04 VPS 实际部署，以及 Ubuntu 20.04 / 24.04、Debian 12 / 13、Alpine 3.22、Rocky 9 的 amd64 隔离环境；后六项的三种协议 HTTPS 测试全部通过。隔离环境共用本机内核，其他内核和 CPU 架构未逐一实测。
+本次使用默认内核 **v26.6.1** 重新验证 Ubuntu 22.04 本机，以及 Ubuntu 20.04 / 24.04、Debian 12 / 13、Alpine 3.22、Rocky 9 的 amd64 隔离环境；三种协议 HTTPS、Reality 诊断和节点管理测试全部通过。
+
+Ubuntu 22.04 还通过了 7 种 SS / SS2022 加密的 TCP / UDP、10 个 Reality 候选域名、首次创建、一键更新保留节点及下载校验失败保护测试。隔离环境共用本机内核，其他内核和 CPU 架构未逐一实测。
 
 支持 systemd、OpenRC、SysVinit、runit 和 procd；未识别到服务管理器时使用手动模式，**手动模式不支持开机自启**。CPU 必须有对应的 Xray 官方 Linux 安装包，系统软件源应可用，Reality 需要 curl 支持 TLS 1.3。
 

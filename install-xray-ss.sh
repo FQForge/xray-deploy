@@ -1,10 +1,10 @@
 #!/bin/sh
 # GitHub 一键安装入口：与 `sh -c "$(curl -fsSL URL)"` 兼容。
-# 默认使用 fengqi0216/xray-deploy，支持环境变量临时覆盖仓库。
+# 默认使用 FQForge/xray-deploy，支持环境变量临时覆盖仓库。
 # 可通过环境变量 XSS_GITHUB_OWNER / XSS_GITHUB_REPO / XSS_GITHUB_REF 临时覆盖。
 set -eu
 
-GITHUB_OWNER="${XSS_GITHUB_OWNER:-fengqi0216}"
+GITHUB_OWNER="${XSS_GITHUB_OWNER:-FQForge}"
 GITHUB_REPO="${XSS_GITHUB_REPO:-xray-deploy}"
 GITHUB_REF="${XSS_GITHUB_REF:-main}"
 

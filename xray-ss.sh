@@ -31,9 +31,9 @@ PID_FILE="${XSS_PID_FILE:-/run/xray-ss.pid}"
 MANUAL_UNIT_FILE="${XSS_MANUAL_UNIT_FILE:-$OPT_DIR/standalone-service.sh}"
 GITHUB_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 # 默认安装目标版本；保留手动输入/选择其他版本的能力。
-DEFAULT_XRAY_VERSION='v26.10.10'
-# 与 3x-ui 实测对照通过的版本；旧 v26.6.1 会拒绝较大的 TLS 证书记录。
-REALITY_MIN_XRAY_VERSION='v26.10.10'
+DEFAULT_XRAY_VERSION='v26.6.1'
+# Reality 使用同一默认版本；候选站点仍需逐个通过实际隧道测试。
+REALITY_MIN_XRAY_VERSION="$DEFAULT_XRAY_VERSION"
 # 三种协议在创建时选择；快速创建使用对应的默认加密和 Reality 参数。
 DEFAULT_SS_METHOD='aes-256-gcm'
 DEFAULT_SS2022_METHOD='2022-blake3-aes-256-gcm'
@@ -585,63 +585,71 @@ release_menu() {
     read -r -p "请输入完整 Xray 版本号（直接回车使用 $DEFAULT_XRAY_VERSION）：" pick
   fi
   pick="${pick:-$DEFAULT_XRAY_VERSION}"
-  valid_version "$pick" || fail '版本号格式无效。'
+  valid_version "$pick" || { fail '版本号格式无效。'; return 1; }
   printf '%s\n' "$pick"
 }
 
-# Download and verify the release asset and install it without replacing live binaries.
+# 条件分支中调用函数时 Bash 会忽略 errexit，下载和校验必须显式检查返回值。
+fetch_xray_archive() {
+  local tag="$1" arch="$2" directory="$3" archive url expected actual
+  archive="Xray-linux-${arch}.zip"
+  url="https://github.com/XTLS/Xray-core/releases/download/$tag/$archive"
+  curl -fLsS --retry 3 --connect-timeout 15 --max-time 240 -o "$directory/$archive" "$url" || {
+    fail "下载 Xray $tag 安装包失败（$arch）。请确认官方已发布该版本和架构，并检查网络：$url"
+    return 1
+  }
+  curl -fLsS --retry 3 --connect-timeout 15 --max-time 60 -o "$directory/$archive.dgst" "$url.dgst" || {
+    fail "下载 Xray $tag 官方校验文件失败，已停止安装：$url.dgst"
+    return 1
+  }
+  expected="$(awk -F '=' '/^[[:space:]]*SHA(2-)?256[[:space:]]*=/{v=$2;gsub(/[[:space:]]/,"",v);print tolower(v);exit}' "$directory/$archive.dgst")" || return 1
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { fail '未找到有效的 SHA256 校验值。'; return 1; }
+  actual="$(sha256sum "$directory/$archive" | awk '{print $1}')" || return 1
+  [[ "$actual" == "$expected" ]] || { fail 'SHA256 校验失败，下载文件与官方校验值不一致。'; return 1; }
+}
+
+# 在版本目录所在文件系统暂存，校验、解压和执行均成功后再原子替换文件。
 download_version() (
   set -euo pipefail
-  local tag="$1" dest="$CORE_DIR/$1" tmp archive url expected actual
-  [[ -x "$dest/xray" ]] && exit 0
-  tmp="$(mktemp -d)"
+  local tag="$1" dest="$CORE_DIR/$1" tmp archive
+  valid_version "$tag" || { fail '版本号格式无效。'; exit 1; }
+  if [[ -x "$dest/xray" ]] && "$dest/xray" -version >/dev/null 2>&1; then exit 0; fi
+  mkdir -p "$CORE_DIR" || exit 1
+  tmp="$(mktemp -d "$CORE_DIR/.install.XXXXXX")" || exit 1
   trap 'rm -rf "$tmp"' EXIT
   archive="Xray-linux-${XRAY_ARCH}.zip"
-  url="https://github.com/XTLS/Xray-core/releases/download/$tag/$archive"
   info "正在下载 Xray $tag，处理器架构：$XRAY_ARCH……" >&2
-  curl -fL --retry 3 --connect-timeout 15 --max-time 240 -o "$tmp/$archive" "$url"
-  curl -fL --retry 3 --connect-timeout 15 --max-time 60 -o "$tmp/$archive.dgst" "$url.dgst"
-  expected="$(awk -F '=' '/^[[:space:]]*SHA(2-)?256[[:space:]]*=/{v=$2;gsub(/[[:space:]]/,"",v);print tolower(v);exit}' "$tmp/$archive.dgst")"
-  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { warn '未找到有效的 SHA256 校验值。'; exit 1; }
-  actual="$(sha256sum "$tmp/$archive" | awk '{print $1}')"
-  [[ "$actual" == "$expected" ]] || { warn 'SHA256 校验失败，下载文件与官方校验值不一致。'; exit 1; }
-  mkdir -p "$dest"
-  if ! unzip -joq "$tmp/$archive" xray -d "$dest"; then
-    rm -rf "$dest"
+  fetch_xray_archive "$tag" "$XRAY_ARCH" "$tmp" || exit 1
+  if ! unzip -joq "$tmp/$archive" xray -d "$tmp"; then
+    warn 'Xray 安装包解压失败，已停止安装。'
     exit 1
   fi
-  chmod 755 "$dest/xray"
-  if ! "$dest/xray" -version >/dev/null 2>&1; then
+  chmod 755 "$tmp/xray" || exit 1
+  if ! "$tmp/xray" -version >/dev/null 2>&1; then
     if [[ "$XRAY_ARCH" == mips32* ]]; then
       # Prefer the in-archive soft-float binary where available (older releases).
-      if unzip -joq "$tmp/$archive" xray_softfloat -d "$dest" >/dev/null 2>&1 &&
-         chmod 755 "$dest/xray_softfloat" &&
-         "$dest/xray_softfloat" -version >/dev/null 2>&1; then
-        mv -f "$dest/xray_softfloat" "$dest/xray"
+      if unzip -joq "$tmp/$archive" xray_softfloat -d "$tmp" >/dev/null 2>&1 &&
+         chmod 755 "$tmp/xray_softfloat" &&
+         "$tmp/xray_softfloat" -version >/dev/null 2>&1; then
+        mv -f "$tmp/xray_softfloat" "$tmp/xray" || exit 1
       else
         # Newer releases may publish a dedicated mips32-softfloat archive.
         local soft_archive="Xray-linux-${XRAY_ARCH}-softfloat.zip"
-        local soft_url="https://github.com/XTLS/Xray-core/releases/download/$tag/$soft_archive"
-        if curl -fL --retry 2 --connect-timeout 15 --max-time 240 -o "$tmp/$soft_archive" "$soft_url" &&
-           curl -fL --retry 2 --connect-timeout 15 --max-time 60 -o "$tmp/$soft_archive.dgst" "$soft_url.dgst"; then
-          expected="$(awk -F '=' '/^[[:space:]]*SHA(2-)?256[[:space:]]*=/{v=$2;gsub(/[[:space:]]/,"",v);print tolower(v);exit}' "$tmp/$soft_archive.dgst")"
-          actual="$(sha256sum "$tmp/$soft_archive" | awk '{print $1}')"
-          if [[ "$expected" =~ ^[0-9a-f]{64}$ && "$actual" == "$expected" ]]; then
-            unzip -joqo "$tmp/$soft_archive" xray -d "$dest" || true
-            chmod 755 "$dest/xray"
-          fi
-        fi
+        fetch_xray_archive "$tag" "${XRAY_ARCH}-softfloat" "$tmp" || exit 1
+        unzip -joqo "$tmp/$soft_archive" xray -d "$tmp" || exit 1
+        chmod 755 "$tmp/xray" || exit 1
       fi
-      if "$dest/xray" -version >/dev/null 2>&1; then
+      if "$tmp/xray" -version >/dev/null 2>&1; then
         info '当前 MIPS 设备已自动使用软浮点内核。' >&2
       fi
     fi
-    if ! "$dest/xray" -version >/dev/null 2>&1; then
-      rm -rf "$dest"
+    if ! "$tmp/xray" -version >/dev/null 2>&1; then
       warn '下载的内核无法执行。请检查 CPU 架构、系统内核和官方发布包兼容性。'
       exit 1
     fi
   fi
+  mkdir -p "$dest" || exit 1
+  mv -f "$tmp/xray" "$dest/xray" || exit 1
   info "校验通过，Xray $tag 安装完成。" >&2
 )
 
@@ -923,7 +931,7 @@ random_reality_servers() {
 }
 
 choose_connection_setup() {
-  local style="${1:-auto}" current_port="${2:-}" choice host port public_port='' nat=false dynamic=false input default_port
+  local style="${1:-auto}" current_port="${2:-}" choice host port public_port='' nat=false dynamic=false input
   ui_title '服务器的网络环境' >&2
   ui_item 1 '独立公网 / 固定 IP（普通 VPS，默认）' >&2
   ui_item 2 'NAT / 端口映射（服务商分配端口、家用路由器）' >&2
@@ -950,13 +958,12 @@ choose_connection_setup() {
       if public_port="$(normalize_port "$input")"; then break; fi
       warn '请填写已分配的 1～65535 端口，或输入 0 返回。'
     done
-    default_port="${current_port:-$public_port}"
-    while :; do
-      read -r -p "对应的本机监听端口（回车使用 $default_port，0 返回）：" input || return 1
-      [[ "$input" != 0 ]] || return 1
-      if port="$(normalize_port "${input:-$default_port}")" && { [[ "$port" == "$current_port" ]] || ! port_in_use "$port"; }; then break; fi
-      warn '本机端口无效或已占用，请按实际映射填写其他空闲端口。'
-    done
+    port="${current_port:-$public_port}"
+    if [[ "$port" != "$current_port" ]] && port_in_use "$port"; then
+      fail "本机端口 $port 已占用，无法创建同端口映射节点。"
+      return 1
+    fi
+    say "本机监听端口使用 $port；如需映射到其他本机端口，可在创建后通过 管理节点 → 修改本机监听端口 调整。" >&2
   elif [[ -n "$current_port" ]]; then
     port="$current_port"
   elif [[ "$style" == custom ]]; then
@@ -2010,7 +2017,7 @@ print_reality_probe_errors() {
   fi
   if [[ -f "$probe_dir/server.json" && -s "$probe_dir/server.log" ]] &&
      awk '/len\(s2cSaved\):/ && /[[:space:]](Server Hello|Change Cipher Spec|Encrypted Extensions|Certificate|Certificate Verify|Finished|New Session Ticket): [0-9]+$/ && ($NF+0)>8192 {found=1} END {exit !found}' "$probe_dir/server.log"; then
-    warn '检测到超过 8192 字节的 TLS 握手记录；旧 Xray v26.6.1 会因此中断连接，运行 xnode install-default 可升级。已验证的 v26.10.10 能处理本次 8273 字节记录；若已升级，请结合后续错误判断。'
+    warn '检测到超过 8192 字节的 TLS 握手记录，可能触发 Xray v26.6.1 的 Reality 握手限制。请更换伪装域名后重新测试，或在高级设置中手动选择兼容的较新官方内核。'
   fi
   for kind in curl client server check; do
     [[ -s "$probe_dir/$kind.log" ]] || continue
@@ -2409,7 +2416,7 @@ Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality）
       sudo xnode diagnose      # 诊断 Reality：服务 / 端口 / 密钥 / 伪装站点
       sudo xnode ddns          # 配置 DDNS 自动更新
       sudo xnode ddns-update   # 立即更新一次 DDNS
-      sudo xnode install-default   # 安装默认 Xray 内核版本 v26.10.10
+      sudo xnode install-default   # 安装默认 Xray 内核版本 v26.6.1
       bash xray-ss.sh check # 检测系统兼容性（无须 root）
 支持多种 Linux 发行版；服务管理方式：systemd / OpenRC / SysVinit / runit / procd / 手动。
 支持的 CPU 架构取决于 Xray 官方发布包；不支持的架构会在安装前提示。
