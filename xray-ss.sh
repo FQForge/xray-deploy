@@ -244,13 +244,39 @@ with_default_dns() {
   ' "$@"
 }
 
+# 只迁移旧版默认日志；保留用户显式开启的日志和自定义日志配置。
+with_default_logging() {
+  jq '
+    if .log==null or .log=={loglevel:"warning"} or .log=={loglevel:"none"} then
+      .log={access:"none",error:"none",loglevel:"none",dnsLog:false}
+    else . end
+  '
+}
+
+logging_disabled() {
+  [[ -f "$CONFIG" ]] && jq -e '.log.loglevel=="none" and (.log.access // "none")=="none"' "$CONFIG" >/dev/null
+}
+
+logging_status() {
+  if logging_disabled; then printf '%s\n' '关闭'; else printf '%s\n' '开启'; fi
+}
+
+prepare_log_file() {
+  local config="${1:-$CONFIG}"
+  jq -e --arg path "$LOG_FILE" '.log.error==$path' "$config" >/dev/null || return 0
+  if [[ -L "$LOG_FILE" || ( -e "$LOG_FILE" && ! -f "$LOG_FILE" ) ]]; then
+    fail "日志路径不是普通文件，已停止修改：$LOG_FILE"; return 1
+  fi
+  mkdir -p "$(dirname "$LOG_FILE")" && touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
+}
+
 init_config() {
   mkdir -p "$ETC_DIR" "$BACKUP_DIR" "$CORE_DIR"
   chmod 700 "$ETC_DIR" "$BACKUP_DIR"
   chmod 755 "$CORE_DIR"
   mkdir -p "$(dirname "$ENTRY")" "$(dirname "$CORE_LINK")"
   if [[ ! -f "$CONFIG" ]]; then
-    if ! with_default_dns <<< '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom"}]}' > "$CONFIG"; then
+    if ! with_default_dns <<< '{"log":{"access":"none","error":"none","loglevel":"none","dnsLog":false},"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom"}]}' > "$CONFIG"; then
       rm -f "$CONFIG"
       fail '无法生成默认节点配置。'; return 1
     fi
@@ -291,6 +317,48 @@ check_managed_service_file() {
   fail "发现同名但不属于此脚本的服务文件，拒绝覆盖或删除：$path"
 }
 
+service_unit_path() {
+  case "$INIT_SYSTEM" in
+    systemd) printf '%s\n' "$UNIT_FILE" ;;
+    openrc) printf '%s\n' "$OPENRC_UNIT_FILE" ;;
+    sysvinit) printf '%s\n' "$SYSV_UNIT_FILE" ;;
+    manual) printf '%s\n' "$MANUAL_UNIT_FILE" ;;
+    runit) printf '%s\n' "$RUNIT_SERVICE_DIR/run" ;;
+    procd) printf '%s\n' "$PROCD_UNIT_FILE" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 日志由内核直接写入指定文件；服务输出丢弃，关闭时也不累积启动横幅。
+# 只更新本项目服务的日志项，保留已有服务中的其他配置。
+configure_service_log_output() {
+  local path tmp
+  jq -e --arg path "$LOG_FILE" '.log.loglevel=="none" or .log.error==$path' "$CONFIG" >/dev/null || return 0
+  path="$(service_unit_path)" || return 1
+  [[ -e "$path" || -L "$path" ]] || return 0
+  check_managed_service_file "$path" || return 1
+  tmp="$(mktemp "$(dirname "$path")/.xray-log-output.XXXXXX")" || return 1
+  if ! cp -p "$path" "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! awk -v init="$INIT_SYSTEM" -v log_path="$LOG_FILE" '
+    init=="systemd" && /^\[/ {
+      service=($0=="[Service]"); print
+      if (service) {
+        print "StandardOutput=null"; print "StandardError=null"
+        print "ReadWritePaths=-" log_path
+      }
+      next
+    }
+    init=="systemd" && service && (/^Standard(Output|Error)=/ || $0=="ReadWritePaths=-" log_path) {next}
+    init=="openrc" && /^(output_log|error_log)=/ {sub(/=.*/, "=\"/dev/null\"")}
+    (init=="sysvinit" || init=="manual") && /^[[:space:]]*nohup / {sub(/>>"\$LOG"/, ">/dev/null")}
+    init=="runit" && /^exec >>/ {$0="exec >/dev/null 2>&1"}
+    init=="procd" && /procd_set_param (stdout|stderr) [01]/ {sub(/[01][[:space:]]*$/, "0")}
+    {print}
+  ' "$path" > "$tmp"; then rm -f "$tmp"; return 1; fi
+  if cmp -s "$path" "$tmp"; then rm -f "$tmp"; return 0; fi
+  if ! mv -f "$tmp" "$path"; then rm -f "$tmp"; return 1; fi
+}
+
 install_service_unit() {
   detect_init_system || return 1
   case "$INIT_SYSTEM" in
@@ -321,7 +389,6 @@ WantedBy=multi-user.target
 EOF
         chmod 644 "$UNIT_FILE"
       fi
-      systemctl daemon-reload
       ;;
     openrc)
       mkdir -p "$(dirname "$OPENRC_UNIT_FILE")" "$(dirname "$LOG_FILE")"
@@ -444,6 +511,9 @@ EOF
       ;;
     *) fail "不支持的服务管理方式：$INIT_SYSTEM"; return 1 ;;
   esac
+  prepare_log_file || return 1
+  configure_service_log_output || return 1
+  service_daemon_reload
 }
 
 service_is_active() {
@@ -566,6 +636,11 @@ service_disable() {
 }
 
 service_logs() {
+  if logging_disabled || jq -e --arg path "$LOG_FILE" '.log.error==$path' "$CONFIG" >/dev/null; then
+    if [[ -f "$LOG_FILE" && ! -L "$LOG_FILE" && -s "$LOG_FILE" ]]; then tail -n 80 "$LOG_FILE"
+    else say '暂时没有本工具记录的日志。'; fi
+    return 0
+  fi
   case "$INIT_SYSTEM" in
     systemd) journalctl -u "$SERVICE" -n 80 --no-pager ;;
     procd)
@@ -869,36 +944,94 @@ apply_config() {
   info '配置校验通过，Xray 服务已运行。'
 }
 
-# 更新工具后自动修复旧版默认 DNS；已停止的服务保持停止，运行中的服务失败则回滚。
-migrate_dns_config() {
-  local candidate backup old_active=0
-  candidate="$(mktemp "$ETC_DIR/.dns-compat.XXXXXX")" || return 1
-  if ! with_default_dns "$CONFIG" > "$candidate"; then
+# 应用运行设置时保留服务的启停状态，失败则一并恢复配置和服务日志设置。
+apply_runtime_config() {
+  local candidate="$1" message="$2" backup path unit_backup='' old_active=0
+  if ! jq -e '(.inbounds | type=="array") and (.log | type=="object")' "$candidate" >/dev/null; then
     rm -f "$candidate"
-    fail '无法生成 DNS 兼容配置，原配置保持不变。'; return 1
+    fail '运行设置 JSON 无效，原配置保持不变。'; return 1
   fi
   if jq -e --slurpfile updated "$candidate" '.==$updated[0]' "$CONFIG" >/dev/null; then
     rm -f "$candidate"
     return 0
   fi
+  # 校验内核配置前就检查日志路径，避免内核跟随符号链接或缺少日志目录。
+  if ! prepare_log_file "$candidate"; then rm -f "$candidate"; return 1; fi
   if [[ -x "$CORE_LINK" ]] && ! "$CORE_LINK" run -test -format json -config "$candidate"; then
     rm -f "$candidate"
-    fail 'DNS 兼容配置未通过 Xray 校验，原配置保持不变。'; return 1
+    fail '运行设置未通过 Xray 校验，原配置保持不变。'; return 1
   fi
-  backup="$(mktemp "$BACKUP_DIR/config-before-dns-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.json")" || { rm -f "$candidate"; return 1; }
-  if ! cp -p "$CONFIG" "$backup"; then rm -f "$candidate"; return 1; fi
+  path="$(service_unit_path)" || { rm -f "$candidate"; return 1; }
+  if [[ -e "$path" || -L "$path" ]]; then
+    check_managed_service_file "$path" || { rm -f "$candidate"; return 1; }
+    unit_backup="$(mktemp "$ETC_DIR/.runtime-service.XXXXXX")" || { rm -f "$candidate"; return 1; }
+    if ! cp -p "$path" "$unit_backup"; then rm -f "$candidate" "$unit_backup"; return 1; fi
+  fi
+  backup="$(mktemp "$BACKUP_DIR/config-before-settings-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.json")" || { rm -f "$candidate" "${unit_backup:-}"; return 1; }
+  if ! cp -p "$CONFIG" "$backup"; then rm -f "$candidate" "${unit_backup:-}" "$backup"; return 1; fi
   if service_is_active; then old_active=1; fi
   if ! chmod 600 "$candidate" || ! mv -f "$candidate" "$CONFIG"; then
+    rm -f "$candidate" "${unit_backup:-}"
+    return 1
+  fi
+  if ! configure_service_log_output || ! service_daemon_reload ||
+     { ((old_active)) && { ! service_restart || ! service_is_active; }; }; then
+    warn '运行设置应用失败，正在恢复上一份配置和服务设置。'
+    cp -p "$backup" "$CONFIG" || { rm -f "${unit_backup:-}"; return 1; }
+    if [[ -n "$unit_backup" ]]; then
+      cp -p "$unit_backup" "$path" || { rm -f "$unit_backup"; return 1; }
+      rm -f "$unit_backup"
+    fi
+    service_daemon_reload || true
+    if ((old_active)); then service_restart || true; fi
+    return 1
+  fi
+  rm -f "${unit_backup:-}"
+  info "$message，原配置已备份：$backup" >&2
+}
+
+# 默认关闭日志，同时补齐旧版 DNS；显式开启和自定义配置均保留。
+migrate_default_config() {
+  local candidate
+  candidate="$(mktemp "$ETC_DIR/.defaults.XXXXXX")" || return 1
+  if ! with_default_dns "$CONFIG" | with_default_logging > "$candidate"; then
     rm -f "$candidate"
-    return 1
+    fail '无法生成默认运行设置，原配置保持不变。'; return 1
   fi
-  if ((old_active)) && { ! service_restart || ! service_is_active; }; then
-    warn 'DNS 兼容配置启动失败，正在恢复上一份配置。'
-    cp -p "$backup" "$CONFIG" || return 1
-    service_restart || true
-    return 1
+  apply_runtime_config "$candidate" '已更新默认日志 / DNS 设置'
+}
+
+set_logging() {
+  local mode="$1" level='none' destination='none' candidate
+  case "$mode" in
+    on) level='warning'; destination="$LOG_FILE" ;;
+    off) ;;
+    *) fail '日志开关只支持 on 或 off。'; return 1 ;;
+  esac
+  candidate="$(mktemp "$ETC_DIR/.logging.XXXXXX")" || return 1
+  if ! jq --arg level "$level" --arg destination "$destination" '
+    .log=(.log // {}) | .log.loglevel=$level | .log.access="none" |
+    .log.error=$destination | .log.dnsLog=false
+  ' "$CONFIG" > "$candidate"; then rm -f "$candidate"; return 1; fi
+  apply_runtime_config "$candidate" '已更新日志开关' || return 1
+  if [[ "$mode" == on ]]; then
+    info "日志已开启（仅 warning / error，不记录访问日志）：$LOG_FILE"
+    info '排障完成后可关闭日志，并清空历史日志以释放空间。'
+  else
+    info '日志已关闭，不再记录 Xray 访问日志和错误日志；历史日志可单独清空。'
   fi
-  info "已补齐加密 DNS 和出站解析策略，原配置已备份：$backup" >&2
+}
+
+clear_logs() {
+  if [[ -L "$LOG_FILE" || ( -e "$LOG_FILE" && ! -f "$LOG_FILE" ) ]]; then
+    fail "日志路径不是普通文件，已拒绝清空：$LOG_FILE"; return 1
+  fi
+  if [[ -e "$LOG_FILE" ]]; then
+    : > "$LOG_FILE" || return 1
+    info '已清空本工具的历史日志。'
+  else
+    info '没有需要清空的本工具日志文件。'
+  fi
 }
 
 next_node_name() {
@@ -2051,6 +2184,8 @@ print_reality_probe_errors() {
   local probe_dir="$1" since="$2" kind heading lines
   if [[ -f "$probe_dir/server.json" ]]; then
     : # 临时实例的日志已经写入 server.log，不能被其他实例的日志覆盖。
+  elif [[ -r "$LOG_FILE" ]] && jq -e --arg path "$LOG_FILE" '.log.error==$path' "$CONFIG" >/dev/null; then
+    tail -n 40 "$LOG_FILE" > "$probe_dir/server.log" 2>/dev/null || true
   elif [[ "$INIT_SYSTEM" == systemd ]] && command -v journalctl >/dev/null 2>&1; then
     journalctl -u "$SERVICE" --since "@$since" -n 40 --no-pager -o cat > "$probe_dir/server.log" 2>/dev/null || true
   elif [[ -r "$LOG_FILE" ]]; then
@@ -2250,6 +2385,7 @@ status() {
   fi
   if service_is_active; then say '服务状态：运行中'; else say '服务状态：未运行'; fi
   if service_is_enabled; then say '开机自启：已启用'; else say '开机自启：未启用或无法识别'; fi
+  say "Xray 日志：$(logging_status)"
   say "服务管理方式：$INIT_SYSTEM"
   say "服务名称：$SERVICE_NAME"
   case "$INIT_SYSTEM" in
@@ -2263,8 +2399,17 @@ status() {
 }
 
 logs() {
-  say '以下为 Xray 服务日志（内核原始内容可能为英文）：'
-  service_logs
+  case "${1:-show}" in
+    show)
+      say "Xray 日志：$(logging_status)（默认关闭）"
+      if logging_disabled; then say '需要排障时执行 xnode logs on；清空历史日志执行 xnode logs clear。'; fi
+      say '以下为已记录的日志（关闭日志后不会新增）：'
+      service_logs
+      ;;
+    on|off) set_logging "$1" ;;
+    clear) clear_logs ;;
+    *) fail '用法：xnode logs [on|off|clear]，不带参数查看日志。'; return 1 ;;
+  esac
 }
 
 uninstall_manager() {
@@ -2371,16 +2516,23 @@ service_menu() {
     ui_item 2 '重启 / 启动 Xray 服务'
     ui_item 3 '查看运行日志'
     ui_item 4 '诊断 Reality 连接问题'
+    say "  日志状态：$(logging_status)（默认关闭）"
+    ui_item 5 '开启日志（排障用，仅记录警告和错误）'
+    ui_item 6 '关闭日志（停止写入）'
+    ui_item 7 '清空本工具的历史日志'
     ui_back '返回主菜单'
-    read -r -p '请选择 [1-4 / 0]：' ans || return 0
+    read -r -p '请选择 [1-7 / 0]：' ans || return 0
     case "$ans" in
       1) status || true ;;
       2) restart_xray || true ;;
       3) logs || true ;;
       4) diagnose_reality_nodes || true ;;
+      5) set_logging on || true ;;
+      6) set_logging off || true ;;
+      7) clear_logs || true ;;
       0) return 0 ;;
       '') continue ;;
-      *) warn '请输入 1～4，或输入 0 返回。' ;;
+      *) warn '请输入 1～7，或输入 0 返回。' ;;
     esac
   done
 }
@@ -2461,6 +2613,9 @@ Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality）
       sudo xnode show          # 选择节点，查看分享链接或出站 JSON
       sudo xnode status        # 查看服务状态
       sudo xnode logs          # 查看运行日志
+      sudo xnode logs on       # 开启警告 / 错误日志（默认关闭）
+      sudo xnode logs off      # 关闭日志
+      sudo xnode logs clear    # 清空本工具的历史日志
       sudo xnode diagnose      # 诊断 Reality：服务 / 端口 / 密钥 / 伪装站点
       sudo xnode ddns          # 配置 DDNS 自动更新
       sudo xnode ddns-update   # 立即更新一次 DDNS
@@ -2511,7 +2666,7 @@ main() {
   require_root
   need_env
   init_config
-  migrate_dns_config || return 1
+  migrate_default_config || return 1
   case "${1:-}" in
     links) show_links ;;
     add) quick_add_node ;;
@@ -2519,7 +2674,7 @@ main() {
     show) view_node_connections ;;
     list) list_nodes ;;
     status) status ;;
-    logs) logs ;;
+    logs) logs "${2:-show}" ;;
     ddns) ddns_menu ;;
     install-default) switch_version "$DEFAULT_XRAY_VERSION" ;;
     '') menu ;;
