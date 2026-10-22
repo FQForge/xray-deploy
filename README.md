@@ -45,6 +45,12 @@ sh -c "$(curl -fsSL https://raw.githubusercontent.com/FQForge/xray-deploy/main/i
 
 Reality 的伪装域名和自己的连接 / DDNS 域名是两个地址，按向导分别设置即可。
 
+**NAT 多出口工具：** 搭建时会持久配置 Cloudflare / Google 加密 DNS，获取真实地址，按可用网络优先使用 IPv4、回退 IPv6，兼容 LazyCat 等使用 Fake-IP 的出口工具。搭建完成后，直接在 `proxy` 等出口工具中切换线路即可，无须重新运行 `xnode`、重建节点或手动重启 Xray。服务商线路及 TCP / UDP 映射仍需正常。
+
+**IPv4 / IPv6：** 系统启用 IPv6 时，同一节点默认同时监听 IPv4 和 IPv6。服务器具备可访问的公网 IPv6 时，客户端可以把服务器地址从 IPv4 改成 IPv6，端口和凭据保持相同；IPv6 分享链接会使用 `[IPv6]:端口` 格式。出站优先 IPv4 不限制 IPv6 接入或访问 IPv6 目标。
+
+已有安装更新到此版本时，会自动备份并补齐缺省 DNS 设置；已有自定义 DNS 和出站解析策略会保留。升级配置时，运行中的 Xray 会重启一次，失败则回滚；已停止的服务保持停止。后续切换出口不需要再次执行更新。
+
 ## 常用操作
 
 | 操作 | 菜单位置 |

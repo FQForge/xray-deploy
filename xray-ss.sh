@@ -37,6 +37,14 @@ REALITY_MIN_XRAY_VERSION="$DEFAULT_XRAY_VERSION"
 # 三种协议在创建时选择；快速创建使用对应的默认加密和 Reality 参数。
 DEFAULT_SS_METHOD='aes-256-gcm'
 DEFAULT_SS2022_METHOD='2022-blake3-aes-256-gcm'
+# 使用 IP 地址引导 DoH，避免 NAT 出口工具把节点目标解析成 Fake-IP。
+# 同时提供 IPv4 / IPv6 入口，兼容只有 IPv6 的服务器。
+DEFAULT_DNS_SERVERS='[
+  "https+local://1.1.1.1/dns-query",
+  "https+local://8.8.8.8/dns-query",
+  "https+local://[2606:4700:4700::1111]/dns-query",
+  "https+local://[2001:4860:4860::8888]/dns-query"
+]'
 # 已在 VPS 上逐个通过 Reality + Vision 和 HTTPS 测试的非 Cloudflare 目标。
 # 每次创建打乱顺序，并在当前服务器重新实测，失败时继续尝试下一项。
 REALITY_SERVERS=(
@@ -224,13 +232,28 @@ need_env() {
   install_missing_dependencies || return 1
 }
 
+# 只为本脚本的 direct 出站补齐缺省项，保留已有自定义 DNS 和解析策略。
+# 按当前可用路由查询真实地址，优先 IPv4、回退 IPv6；保留私有地址拦截。
+with_default_dns() {
+  jq --argjson servers "$DEFAULT_DNS_SERVERS" '
+    if any(.outbounds[]?; .tag=="direct" and .protocol=="freedom") then
+      (if .dns==null then .dns={servers:$servers,queryStrategy:"UseSystem",enableParallelQuery:true} else . end) |
+      (.outbounds[] | select(.tag=="direct" and .protocol=="freedom" and .settings.domainStrategy==null)
+        | .settings.domainStrategy)="UseIPv4v6"
+    else . end
+  ' "$@"
+}
+
 init_config() {
   mkdir -p "$ETC_DIR" "$BACKUP_DIR" "$CORE_DIR"
   chmod 700 "$ETC_DIR" "$BACKUP_DIR"
   chmod 755 "$CORE_DIR"
   mkdir -p "$(dirname "$ENTRY")" "$(dirname "$CORE_LINK")"
   if [[ ! -f "$CONFIG" ]]; then
-    printf '%s\n' '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom"}]}' > "$CONFIG"
+    if ! with_default_dns <<< '{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"tag":"direct","protocol":"freedom"}]}' > "$CONFIG"; then
+      rm -f "$CONFIG"
+      fail '无法生成默认节点配置。'; return 1
+    fi
     chmod 600 "$CONFIG"
   fi
   if [[ ! -f "$NODE_HOSTS_FILE" ]]; then
@@ -844,6 +867,38 @@ apply_config() {
     return 1
   fi
   info '配置校验通过，Xray 服务已运行。'
+}
+
+# 更新工具后自动修复旧版默认 DNS；已停止的服务保持停止，运行中的服务失败则回滚。
+migrate_dns_config() {
+  local candidate backup old_active=0
+  candidate="$(mktemp "$ETC_DIR/.dns-compat.XXXXXX")" || return 1
+  if ! with_default_dns "$CONFIG" > "$candidate"; then
+    rm -f "$candidate"
+    fail '无法生成 DNS 兼容配置，原配置保持不变。'; return 1
+  fi
+  if jq -e --slurpfile updated "$candidate" '.==$updated[0]' "$CONFIG" >/dev/null; then
+    rm -f "$candidate"
+    return 0
+  fi
+  if [[ -x "$CORE_LINK" ]] && ! "$CORE_LINK" run -test -format json -config "$candidate"; then
+    rm -f "$candidate"
+    fail 'DNS 兼容配置未通过 Xray 校验，原配置保持不变。'; return 1
+  fi
+  backup="$(mktemp "$BACKUP_DIR/config-before-dns-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX.json")" || { rm -f "$candidate"; return 1; }
+  if ! cp -p "$CONFIG" "$backup"; then rm -f "$candidate"; return 1; fi
+  if service_is_active; then old_active=1; fi
+  if ! chmod 600 "$candidate" || ! mv -f "$candidate" "$CONFIG"; then
+    rm -f "$candidate"
+    return 1
+  fi
+  if ((old_active)) && { ! service_restart || ! service_is_active; }; then
+    warn 'DNS 兼容配置启动失败，正在恢复上一份配置。'
+    cp -p "$backup" "$CONFIG" || return 1
+    service_restart || true
+    return 1
+  fi
+  info "已补齐加密 DNS 和出站解析策略，原配置已备份：$backup" >&2
 }
 
 next_node_name() {
@@ -2456,6 +2511,7 @@ main() {
   require_root
   need_env
   init_config
+  migrate_dns_config || return 1
   case "${1:-}" in
     links) show_links ;;
     add) quick_add_node ;;
