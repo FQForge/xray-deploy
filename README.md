@@ -7,7 +7,7 @@
 登录 VPS 后执行：
 
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/fengqi0216/xray-deploy/main/install-xray-ss.sh)"
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/FQForge/xray-deploy/main/install-xray-ss.sh)"
 ```
 
 安装后自动打开菜单。以后输入 `xnode` 即可；普通用户使用 `sudo xnode`。首次创建会自动安装 Xray 内核和所需依赖。
