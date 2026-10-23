@@ -915,6 +915,7 @@ ensure_reality_core() {
   switch_version "$DEFAULT_XRAY_VERSION"
 }
 
+# 新内核按后缀识别配置；送检的临时配置文件也必须使用 .json 后缀。
 apply_config() {
   local candidate="$1" backup old_active=0
   need_core
@@ -994,7 +995,7 @@ apply_runtime_config() {
 # 默认关闭日志，同时补齐旧版 DNS；显式开启和自定义配置均保留。
 migrate_default_config() {
   local candidate
-  candidate="$(mktemp "$ETC_DIR/.defaults.XXXXXX")" || return 1
+  candidate="$(mktemp "$ETC_DIR/.defaults.XXXXXX.json")" || return 1
   if ! with_default_dns "$CONFIG" | with_default_logging > "$candidate"; then
     rm -f "$candidate"
     fail '无法生成默认运行设置，原配置保持不变。'; return 1
@@ -1009,7 +1010,7 @@ set_logging() {
     off) ;;
     *) fail '日志开关只支持 on 或 off。'; return 1 ;;
   esac
-  candidate="$(mktemp "$ETC_DIR/.logging.XXXXXX")" || return 1
+  candidate="$(mktemp "$ETC_DIR/.logging.XXXXXX.json")" || return 1
   if ! jq --arg level "$level" --arg destination "$destination" '
     .log=(.log // {}) | .log.loglevel=$level | .log.access="none" |
     .log.error=$destination | .log.dnsLog=false
@@ -1355,7 +1356,7 @@ create_reality_node() {
 commit_new_node() {
   local tag="$1" node="$2" host="$3" meta="$4" tmp port public_port traffic
   if resolve_node_tag "${tag#*-}" >/dev/null 2>&1; then fail '节点名称已存在，请重新创建。'; return 1; fi
-  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")" || return 1
+  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")" || return 1
   jq --argjson node "$node" '.inbounds += [$node]' "$CONFIG" > "$tmp" || { rm -f "$tmp"; return 1; }
   if ! save_node_host "$tag" "$host"; then rm -f "$tmp"; return 1; fi
   if ! save_node_meta "$tag" "$meta"; then remove_node_host "$tag"; rm -f "$tmp"; return 1; fi
@@ -1448,7 +1449,7 @@ change_port() {
   local tag="${1:-}" port tmp
   if [[ -z "$tag" ]]; then tag="$(choose_node)" || return 1; fi
   port="$(choose_port)" || return 1
-  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")"
+  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")"
   jq --arg t "$tag" --argjson p "$port" '(.inbounds[] | select(.tag==$t) | .port)=$p' "$CONFIG" > "$tmp"
   apply_config "$tmp" || return 1
   warn "请在本机防火墙放行新监听端口 $port。"
@@ -1485,7 +1486,7 @@ change_node_endpoint() {
     restore_node_endpoints "$old_hosts" "$old_meta"; return 1
   fi
   if [[ "$port" != "$old_port" ]]; then
-    tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")" || { restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
+    tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")" || { restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
     jq --arg t "$tag" --argjson p "$port" '(.inbounds[]|select(.tag==$t)|.port)=$p' "$CONFIG" > "$tmp" || { rm -f "$tmp"; restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
     if ! apply_config "$tmp"; then restore_node_endpoints "$old_hosts" "$old_meta"; return 1; fi
   fi
@@ -1502,7 +1503,7 @@ delete_node() {
   if [[ -z "$tag" ]]; then tag="$(choose_node)" || return 1; fi
   read -r -p "将删除节点 $(visible_node_name "$tag")，请输入 '确认删除' 以继续：" yes || return 2
   [[ "$yes" == "确认删除" ]] || { info '已取消删除。'; return 2; }
-  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX")"
+  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")"
   jq --arg t "$tag" '.inbounds |= map(select(.tag!=$t))' "$CONFIG" > "$tmp"
   if apply_config "$tmp"; then
     remove_node_host "$tag" || warn '节点已删除，但独立连接地址记录清理失败。'
