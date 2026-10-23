@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Xray SS Manager: standalone SS / SS2022 / VLESS + Reality node manager.
+# Xray SS Manager: standalone SS / SS2022 / VLESS + Reality / SOCKS5 / HTTP node manager.
 # Supports major Linux distributions and common init systems; see README for scope.
 # This is an independent implementation, not a fork of singbox-deploy.
 set -Eeuo pipefail
@@ -34,7 +34,7 @@ GITHUB_API='https://api.github.com/repos/XTLS/Xray-core/releases'
 DEFAULT_XRAY_VERSION='v26.6.1'
 # Reality 使用同一默认版本；候选站点仍需逐个通过实际隧道测试。
 REALITY_MIN_XRAY_VERSION="$DEFAULT_XRAY_VERSION"
-# 三种协议在创建时选择；快速创建使用对应的默认加密和 Reality 参数。
+# 创建时选择协议；快速创建使用对应的默认加密、Reality 参数和代理账号。
 DEFAULT_SS_METHOD='aes-256-gcm'
 DEFAULT_SS2022_METHOD='2022-blake3-aes-256-gcm'
 # 使用 IP 地址引导 DoH，避免 NAT 出口工具把节点目标解析成 Fake-IP。
@@ -875,6 +875,7 @@ resolve_node_tag() {
     xss-*) choices=("$input" "ss-${input#xss-}") ;;
     *) choices=("$input" "ss-$input" "xss-$input" "vless-$input") ;;
   esac
+  choices+=("socks5-$input" "http-$input")
   for tag in "${choices[@]}"; do
     if [[ -f "$CONFIG" ]] && jq -e --arg t "$tag" '.inbounds[]? | select(.tag==$t)' "$CONFIG" >/dev/null; then
       printf '%s\n' "$tag"
@@ -1042,7 +1043,7 @@ next_node_name() {
 
 add_node() {
   init_config || return 1
-  local name method='' default_name protocol endpoint sni=''
+  local name method='' default_name protocol endpoint sni='' credentials=''
   ui_title '自定义创建节点'
   protocol="$(choose_protocol)" || return 1
   default_name="$(next_node_name)" || return 1
@@ -1054,12 +1055,14 @@ add_node() {
   fi
   if [[ "$protocol" == vless ]]; then
     sni="$(choose_reality_server)" || return 1
+  elif [[ "$protocol" == socks || "$protocol" == http ]]; then
+    credentials="$(choose_proxy_credentials)" || return 1
   else
     method="$(choose_method "$protocol")" || return 1
   fi
   endpoint="$(choose_connection_setup custom)" || return 1
   ensure_core_for_new_node || return 1
-  create_selected_node "$protocol" "$name" "$method" "$endpoint" "$sni"
+  create_selected_node "$protocol" "$name" "$method" "$endpoint" "$sni" "$credentials"
 }
 
 quick_add_node() {
@@ -1079,18 +1082,47 @@ choose_protocol() {
   ui_item 1 'SS（兼容常见客户端）' >&2
   ui_item 2 'SS2022（客户端需支持 Shadowsocks 2022）' >&2
   ui_item 3 'VLESS + Reality（自动生成 UUID 和密钥）' >&2
+  ui_item 4 'SOCKS5（账号密码认证，TCP 代理）' >&2
+  ui_item 5 'HTTP（账号密码认证，支持 CONNECT）' >&2
   ui_item 0 '取消创建' >&2
   local choice
   while :; do
-    read -r -p '请选择协议 [1-3，回车选 SS，0 返回]：' choice || return 1
+    read -r -p '请选择协议 [1-5，回车选 SS，0 返回]：' choice || return 1
     case "$choice" in
       1|'') printf 'ss\n'; return 0 ;;
       2) printf 'ss2022\n'; return 0 ;;
       3) printf 'vless\n'; return 0 ;;
+      4) printf 'socks\n'; return 0 ;;
+      5) printf 'http\n'; return 0 ;;
       0) return 1 ;;
-      *) warn '请输入 1、2、3 或 0。' ;;
+      *) warn '请输入 1～5，或输入 0 返回。' ;;
     esac
   done
+}
+
+valid_proxy_credential() {
+  jq -en --arg value "$1" --arg kind "$2" '
+    ($value | utf8bytelength) as $size |
+    ($size >= 1 and $size <= 255) and
+    ($value | explode | all(.[]; . >= 32 and . != 127)) and
+    ($kind != "username" or ($value | contains(":") | not))
+  ' >/dev/null
+}
+
+choose_proxy_credentials() {
+  local username password
+  say '请设置代理账号和密码（均必填，最长 255 字节；密码输入时明文显示）。' >&2
+  while :; do
+    IFS= read -r -p '代理账号：' username || return 1
+    if valid_proxy_credential "$username" username; then break; fi
+    warn '账号不能为空、超过 255 字节或包含冒号、控制字符。'
+  done
+  while :; do
+    IFS= read -r -p '代理密码（明文显示）：' password || return 1
+    if valid_proxy_credential "$password" password; then break; fi
+    warn '密码不能为空、超过 255 字节或包含控制字符。'
+  done
+  jq -n --arg user "$username" --arg pass "$password" '{user:$user,pass:$pass}'
 }
 
 choose_reality_server() {
@@ -1171,11 +1203,13 @@ choose_connection_setup() {
 }
 
 create_selected_node() {
-  local protocol="$1" name="$2" method="$3" endpoint="$4" sni="$5" port host
+  local protocol="$1" name="$2" method="$3" endpoint="$4" sni="$5" credentials="${6:-}" port host
   port="$(jq -er .port <<< "$endpoint")" || return 1
   host="$(jq -er .host <<< "$endpoint")" || return 1
   if [[ "$protocol" == vless ]]; then
     create_reality_node "$name" "$port" "$host" "$endpoint" "$sni"
+  elif [[ "$protocol" == socks || "$protocol" == http ]]; then
+    create_proxy_node "$protocol" "$name" "$port" "$host" "$endpoint" "$credentials"
   else
     create_node "$name" "$method" "$port" "$host" "$endpoint"
   fi
@@ -1193,6 +1227,29 @@ create_node() {
     --arg pass "$pass" --arg network "$network" --arg listen "$listen" \
     '{tag:$tag,listen:$listen,port:$port,protocol:"shadowsocks",settings:{method:$method,password:$pass,network:$network}}')" || return 1
   [[ -n "$meta" ]] || meta='{}'
+  commit_new_node "$tag" "$node" "$host" "$meta"
+}
+
+create_proxy_node() {
+  local protocol="$1" name="$2" port="$3" host="$4" meta="$5" credentials="${6:-}"
+  local prefix="$protocol" tag username password node listen
+  [[ "$protocol" != socks ]] || prefix=socks5
+  tag="$prefix-$name"
+  if [[ -z "$credentials" ]]; then
+    username="user_$(openssl rand -hex 6)" || return 1
+    password="$(new_password "$protocol")" || return 1
+  else
+    username="$(jq -er '.user | select(type=="string")' <<< "$credentials")" || return 1
+    password="$(jq -er '.pass | select(type=="string")' <<< "$credentials")" || return 1
+  fi
+  if ! valid_proxy_credential "$username" username || ! valid_proxy_credential "$password" password; then
+    fail '代理账号或密码无效，未创建节点。'; return 1
+  fi
+  listen="$(node_listen_address)"
+  node="$(jq -n --arg tag "$tag" --argjson port "$port" --arg protocol "$protocol" \
+    --arg user "$username" --arg pass "$password" --arg listen "$listen" '
+    {tag:$tag,listen:$listen,port:$port,protocol:$protocol,settings:{accounts:[{user:$user,pass:$pass}]}} |
+    if $protocol=="socks" then .settings += {auth:"password",udp:false} else . end')" || return 1
   commit_new_node "$tag" "$node" "$host" "$meta"
 }
 
@@ -1318,7 +1375,7 @@ commit_new_node() {
   fi
   port="$(jq -r .port <<< "$node")"
   public_port="$(node_public_port "$tag")" || return 1
-  if [[ "$tag" == vless-* ]]; then traffic='TCP'; else traffic='TCP + UDP'; fi
+  if [[ "$tag" == vless-* || "$tag" == socks5-* || "$tag" == http-* ]]; then traffic='TCP'; else traffic='TCP + UDP'; fi
   info "已创建节点：$tag。"
   warn "请在服务器防火墙中放行本机端口 $port（$traffic）。"
   if jq -e '.nat==true' <<< "$meta" >/dev/null; then
@@ -1328,7 +1385,11 @@ commit_new_node() {
     say "请同时在服务商安全组中放行公网端口 $public_port（$traffic）。"
   fi
   if show_node_connection "$tag"; then
-    say '下一步：复制上面的完整链接，在客户端选择“从剪贴板导入”。'
+    if [[ "$tag" == socks5-* || "$tag" == http-* ]]; then
+      say '下一步：在客户端填写地址、端口和账号密码；支持此类链接的客户端也可直接导入。'
+    else
+      say '下一步：复制上面的完整链接，在客户端选择“从剪贴板导入”。'
+    fi
     if [[ "$tag" == vless-* ]]; then say 'Reality 无法连接时，运行 sudo xnode diagnose 检查原因。'; fi
   else
     warn '节点已创建，但连接信息显示失败。可在主菜单 2 中重新查看。'
@@ -1341,7 +1402,8 @@ list_nodes() {
   rows="$(jq -r --slurpfile meta "$NODE_META_FILE" '.inbounds | to_entries[] | .key as $i | .value |
     [($i+1|tostring), (.tag | if startswith("xss-") then "ss-" + .[4:] else . end), (.port|tostring),
      (($meta[0][.tag].public_port // .port)|tostring),
-     (if .protocol=="vless" then "VLESS+Reality" else (.settings.method // (.settings.users[0].method // "未知")) end)] | @tsv' "$CONFIG")" || return 1
+     (if .protocol=="vless" then "VLESS+Reality" elif .protocol=="socks" then "SOCKS5"
+      elif .protocol=="http" then "HTTP" else (.settings.method // (.settings.users[0].method // "未知")) end)] | @tsv' "$CONFIG")" || return 1
   [[ -n "$rows" ]] || { say '当前没有任何节点。主菜单选择 1 即可快速创建。'; return 0; }
   {
     printf '序号\t节点名称\t本机端口\t公网端口\t协议/加密\n'
@@ -1890,7 +1952,7 @@ node_reality_public_key() {
 }
 
 make_node_uri() {
-  local tag="$1" node host port display protocol method password uuid sni sid public label hostpart
+  local tag="$1" node host port display protocol method password uuid sni sid public label hostpart username scheme
   node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CONFIG")" || return 1
   host="$(node_share_host "$tag")" || return 1
   port="$(node_public_port "$tag")" || return 1
@@ -1914,6 +1976,15 @@ make_node_uri() {
       hostpart="$host"; [[ "$host" != *:* ]] || hostpart="[$host]"
       printf 'vless://%s@%s:%s?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=%s&fp=chrome&pbk=%s&sid=%s#%s\n' \
         "$uuid" "$hostpart" "$port" "$sni" "$public" "$sid" "$label"
+      ;;
+    socks|http)
+      jq -e '(.settings.accounts | length)==1' <<< "$node" >/dev/null || return 1
+      username="$(jq -er '.settings.accounts[0].user | @uri' <<< "$node")" || return 1
+      password="$(jq -er '.settings.accounts[0].pass | @uri' <<< "$node")" || return 1
+      scheme="$protocol"; [[ "$protocol" != socks ]] || scheme=socks5
+      hostpart="$host"; [[ "$host" != *:* ]] || hostpart="[$host]"
+      label="$(jq -rn --arg s "$display" '$s|@uri')"
+      printf '%s://%s:%s@%s:%s#%s\n' "$scheme" "$username" "$password" "$hostpart" "$port" "$label"
       ;;
     *) fail '暂不支持此节点的分享链接。'; return 1 ;;
   esac
@@ -1975,6 +2046,13 @@ show_node_connection() {
     say '传输方式：TCP；客户端需支持 Reality 和 Vision。'
     say ''
     say 'VLESS + Reality 分享链接（复制到客户端即可导入）：'
+  elif [[ "$protocol" == socks || "$protocol" == http ]]; then
+    if [[ "$protocol" == socks ]]; then say '协议：SOCKS5'; else say '协议：HTTP（支持 CONNECT）'; fi
+    say '传输方式：TCP；账号密码认证。'
+    say "代理账号：$(jq -r '.settings.accounts[0].user' <<< "$node")"
+    say "代理密码：$(jq -r '.settings.accounts[0].pass' <<< "$node")"
+    say ''
+    say '代理连接链接（客户端支持时可导入，也可手动填写地址、端口和账号密码）：'
   else
     method="$(jq -r .settings.method <<< "$node")"
     if [[ "$method" == 2022-* ]]; then say '协议：SS2022'; else say '协议：SS'; fi
@@ -2008,6 +2086,13 @@ make_node_outbound_json() {
         users:[{id:.settings.clients[0].id,encryption:"none",flow:(.settings.clients[0].flow // "xtls-rprx-vision")}]}]},
        streamSettings:{network:"tcp",security:"reality",realitySettings:{fingerprint:"chrome",publicKey:$public,
          serverName:.streamSettings.realitySettings.serverNames[0],shortId:.streamSettings.realitySettings.shortIds[0]}}}' "$CONFIG"
+    return $?
+  fi
+  if [[ "$protocol" == socks || "$protocol" == http ]]; then
+    jq -e --arg t "$tag" --arg host "$host" --argjson port "$port" --arg display "$display_tag" '
+      .inbounds[] | select(.tag==$t and (.settings.accounts | length)==1) |
+      {tag:$display,protocol:.protocol,settings:{servers:[{address:$host,port:$port,
+        users:[{user:.settings.accounts[0].user,pass:.settings.accounts[0].pass}]}]}}' "$CONFIG"
     return $?
   fi
   if ! jq -e --arg t "$tag" '
@@ -2062,6 +2147,9 @@ show_links() {
   fi
   ui_title '节点分享链接'
   say '复制 ss:// 或 vless:// 开头的完整一行，在客户端选择“从剪贴板导入”。'
+  if jq -e '.inbounds[]? | select(.protocol=="socks" or .protocol=="http")' "$CONFIG" >/dev/null; then
+    say 'SOCKS5 / HTTP 提供 socks5:// / http:// 链接；客户端不支持导入时，可在管理节点中查看账号密码手动配置。'
+  fi
   local host tag display port method password nickname
   while IFS=$'\t' read -r tag port method password nickname; do
     [[ -n "$tag" ]] || continue
@@ -2080,7 +2168,7 @@ show_links() {
     [[ -n "$tag" ]] || continue
     printf '\n%s\n' "$(visible_node_name "$tag")"
     make_node_uri "$tag" || warn "节点 $tag 的分享链接生成失败。"
-  done < <(jq -r '.inbounds[]?|select(.protocol=="vless")|.tag' "$CONFIG")
+  done < <(jq -r '.inbounds[]?|select(.protocol=="vless" or .protocol=="socks" or .protocol=="http")|.tag' "$CONFIG")
   warn '以上链接包含节点密钥，请妥善保管，不要公开传播。'
 }
 
@@ -2095,7 +2183,7 @@ view_node_connections() {
   while :; do
     say ''
     ui_title "查看节点：$(visible_node_name "$tag")"
-    ui_item 1 '查看 SS / SS2022 / Reality 连接链接'
+    ui_item 1 '查看 SS / SS2022 / Reality / SOCKS5 / HTTP 连接链接'
     ui_item 2 '查看 Xray 出站 JSON（用于 3x-ui 手动添加出站）'
     ui_back
     read -r -p '请输入选项（1/2/0）：' choice || return 0
@@ -2541,7 +2629,7 @@ advanced_menu() {
   local ans tag
   while :; do
     ui_title '高级设置'
-    ui_item 1 '自定义创建节点（名称 / 加密 / 端口 / 域名）'
+    ui_item 1 '自定义创建节点（名称 / 加密 / 账号密码 / 端口 / 域名）'
     ui_item 2 "安装或切换 Xray 内核版本（默认 $DEFAULT_XRAY_VERSION）"
     ui_item 3 'DDNS 自动更新（Cloudflare / DuckDNS）'
     ui_item 4 '检测 Linux 系统兼容性'
@@ -2566,10 +2654,10 @@ advanced_menu() {
 menu() {
   local ans result
   while :; do
-    ui_title 'Xray 节点管理系统（SS / SS2022 / Reality）'
+    ui_title 'Xray 节点管理系统（SS / SS2022 / Reality / SOCKS5 / HTTP）'
     menu_summary
     ui_section '常用操作'
-    ui_text '1;32' '  1）快速创建节点（SS / SS2022 / VLESS + Reality）'
+    ui_text '1;32' '  1）快速创建节点（SS / SS2022 / VLESS + Reality / SOCKS5 / HTTP）'
     ui_item 2 '查看 / 复制分享链接'
     ui_item 3 '查看已有节点'
     ui_section '管理与维护'
@@ -2603,11 +2691,11 @@ menu() {
 
 usage() {
   cat <<'TXT'
-Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality）
+Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality / SOCKS5 / HTTP）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
       sudo xnode add           # 选择协议和网络环境，快速创建节点
-      sudo xnode custom        # 自定义名称、加密方式、端口及域名
+      sudo xnode custom        # 自定义名称、加密方式、代理账号密码、端口及域名
       sudo xnode links         # 查看所有节点分享链接
       sudo xnode list          # 查看已有节点
       sudo xnode show          # 选择节点，查看分享链接或出站 JSON
