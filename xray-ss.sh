@@ -16,6 +16,7 @@ CONFIG="$ETC_DIR/config.json"
 HOST_FILE="$ETC_DIR/host.txt"    # 旧版全局连接地址：仅用于读取旧节点
 NODE_HOSTS_FILE="$ETC_DIR/node-hosts.json"
 NODE_META_FILE="$ETC_DIR/node-meta.json"
+INBOUNDS_FILE="$ETC_DIR/inbounds.json"
 DDNS_FILE="$ETC_DIR/ddns.json"
 DDNS_SERVICE_FILE="${XSS_DDNS_SERVICE_FILE:-/etc/systemd/system/xnode-ddns.service}"
 DDNS_TIMER_FILE="${XSS_DDNS_TIMER_FILE:-/etc/systemd/system/xnode-ddns.timer}"
@@ -295,6 +296,7 @@ init_config() {
     cp "${BASH_SOURCE[0]}" "$ENTRY"
     chmod 700 "$ENTRY"
   fi
+  init_inbound_store
 }
 
 service_daemon_reload() {
@@ -785,6 +787,7 @@ switch_version() {
 
 port_in_use() {
   local port="$1"
+  if [[ -f "$INBOUNDS_FILE" ]] && jq -e --argjson p "$port" '.inbounds[]? | select(.config.port==$p)' "$INBOUNDS_FILE" >/dev/null; then return 0; fi
   if [[ -f "$CONFIG" ]] && jq -e --argjson p "$port" '.inbounds[]? | select(.port==$p)' "$CONFIG" >/dev/null; then return 0; fi
   if command -v ss >/dev/null && ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${port}$"; then return 0; fi
   if command -v netstat >/dev/null && netstat -lntu 2>/dev/null | awk 'NR>2 {print $4}' | grep -Eq "(^|:)${port}$"; then return 0; fi
@@ -803,7 +806,7 @@ normalize_port() {
 choose_port() {
   local proposed='' tries=0
   if [[ "${1:-}" != auto ]]; then
-    read -r -p '请输入节点端口（直接回车自动选择空闲端口）：' proposed || return 1
+    read -r -p '本机监听端口（直接回车自动选择空闲端口）：' proposed || return 1
   fi
   if [[ -z "$proposed" ]]; then
     while ((tries < 50)); do
@@ -868,6 +871,8 @@ visible_node_name() {
 # 兼容选择新标签、旧标签和不带前缀的名称，避免升级后无法管理原有节点。
 resolve_node_tag() {
   local input="$1" tag
+  local -a sources=("$CONFIG")
+  [[ ! -f "$INBOUNDS_FILE" ]] || sources+=("$INBOUNDS_FILE")
   local -a choices=()
   case "$input" in
     ss-*) choices=("$input" "xss-${input#ss-}") ;;
@@ -877,12 +882,12 @@ resolve_node_tag() {
   esac
   choices+=("socks5-$input" "http-$input")
   for tag in "${choices[@]}"; do
-    if [[ -f "$CONFIG" ]] && jq -e --arg t "$tag" '.inbounds[]? | select(.tag==$t)' "$CONFIG" >/dev/null; then
+    if [[ -f "$CONFIG" ]] && jq -se --arg t "$tag" 'any(.[].inbounds[]?; .tag==$t)' "${sources[@]}" >/dev/null; then
       printf '%s\n' "$tag"
       return 0
     fi
   done
-  fail '未找到指定节点。'
+  fail '未找到指定入站。'
 }
 
 # 用户选择创建节点即自动准备缺失的内核；已安装时保留当前版本。
@@ -1036,50 +1041,341 @@ clear_logs() {
   fi
 }
 
+# 管理数据与 Xray 运行配置分离：空入站、停用入站和停用客户端不写入运行配置。
+# config 保存协议/传输设置；clients 保存稳定 ID、显示名称、开关和协议凭据。
+inbound_record() {
+  jq '
+    def usable_name:
+      type=="string" and length>=1 and length<=48 and
+      (startswith(" ")|not) and (endswith(" ")|not) and
+      (explode | all(.[]; .>=32 and .!=127 and .!=47 and .!=92));
+    def available_name($base; $n):
+      (if $n==0 then $base else $base[0:36]+" ("+($n|tostring)+")" end) as $name |
+      if any(.[]; .name==$name) then available_name($base; $n+1) else $name end;
+    (if .protocol=="shadowsocks" then
+       if ((.settings.clients // .settings.users) | type)=="array" then
+         (.settings.clients // .settings.users)
+       else [{password:.settings.password,method:.settings.method,email:.settings.email}] end
+     elif .protocol=="vless" then .settings.clients
+     else .settings.accounts end // []) as $accounts |
+    {tag:.tag,enabled:true,
+     mode:(if .protocol=="shadowsocks" and (.settings.method // "" | startswith("2022-")) and
+       ((.settings.clients // .settings.users) | type)!="array" then "single" else "multi" end),
+     config:(. | .settings |= del(.clients,.users,.accounts) |
+       if .protocol=="shadowsocks" and (.settings.method // "" | startswith("2022-") | not)
+       then .settings |= del(.password,.email,.level) else . end),
+     clients:($accounts | to_entries | map({
+       key:("legacy-"+(.key+1|tostring)),
+       name:(if (.value.email // "")!="" then .value.email else "客户端"+(.key+1|tostring) end),
+       enabled:true,account:(.value | with_entries(select(.value!=null)))}))} |
+    .clients |= reduce to_entries[] as $entry ([];
+      (if ($entry.value.name|usable_name) then $entry.value.name else "客户端"+($entry.key+1|tostring) end) as $base |
+      available_name($base;0) as $name | . + [($entry.value | .name=$name)])
+  '
+}
+
+init_inbound_store() {
+  if [[ -f "$INBOUNDS_FILE" ]]; then
+    validate_inbound_state "$INBOUNDS_FILE" || {
+      fail '入站管理数据无效，已停止操作；请从备份恢复 inbounds.json。'; return 1;
+    }
+    return 0
+  fi
+  local tmp node record records='[]' backup
+  tmp="$(mktemp "$ETC_DIR/.inbounds-import.XXXXXX.json")" || return 1
+  while IFS= read -r node; do
+    record="$(inbound_record <<< "$node")" || { rm -f "$tmp"; return 1; }
+    records="$(jq --argjson r "$record" '.+[$r]' <<< "$records")" || { rm -f "$tmp"; return 1; }
+  done < <(jq -c '.inbounds[]? | select(
+    (.protocol=="shadowsocks" and all((.settings.clients // .settings.users // [])[]; .address==null)) or
+    (.protocol=="vless" and .streamSettings.security=="reality" and
+      ((.streamSettings.network // "tcp")=="tcp" or .streamSettings.network=="raw")) or
+    (.protocol=="socks" and .settings.auth=="password") or
+    (.protocol=="http" and (.settings.accounts|length)>0))' "$CONFIG")
+  jq -n --argjson records "$records" '{schema_version:1,inbounds:$records}' > "$tmp" || { rm -f "$tmp"; return 1; }
+  if [[ "$records" != '[]' ]]; then
+    backup="$(mktemp -d "$BACKUP_DIR/before-inbound-import-XXXXXX")" || { rm -f "$tmp"; return 1; }
+    cp -p "$CONFIG" "$NODE_HOSTS_FILE" "$NODE_META_FILE" "$backup/" || { rm -f "$tmp"; return 1; }
+    info "原节点已导入为入站和客户端，地址、端口及凭据保留。迁移备份：$backup" >&2
+  fi
+  chmod 600 "$tmp" && mv -f "$tmp" "$INBOUNDS_FILE"
+}
+
+get_inbound() {
+  jq -ec --arg t "$1" '.inbounds[] | select(.tag==$t)' "$INBOUNDS_FILE"
+}
+
+# 单客户端 SS2022 保留原始密码格式；新增 AES 入站从首个客户端起使用多用户格式。
+render_inbound_config() {
+  local state="$1"
+  jq --slurpfile old "$INBOUNDS_FILE" --slurpfile state "$state" '
+    def native:
+      . as $i | [.clients[] | select(.enabled) | .account] as $a |
+      .config |
+      if .protocol=="vless" then .settings.clients=$a
+      elif .protocol=="socks" or .protocol=="http" then .settings.accounts=$a
+      elif $i.mode=="single" then .settings.password=$a[0].password
+      else .settings.users=$a end;
+    ([$old[0].inbounds[].tag, $state[0].inbounds[].tag] | unique) as $managed |
+    .inbounds=([.inbounds[] | select(.tag as $t | $managed | index($t) | not)] +
+      [$state[0].inbounds[] | select(.enabled and any(.clients[]; .enabled)) | native])
+  ' "$CONFIG"
+}
+
+validate_inbound_state() {
+  jq -e '
+    .schema_version==1 and (.inbounds|type)=="array" and
+    ([.inbounds[].tag]|length)==([.inbounds[].tag]|unique|length) and
+    all(.inbounds[];
+      (.tag|type)=="string" and .tag==.config.tag and (.enabled|type)=="boolean" and
+      (.mode=="single" or .mode=="multi") and (.clients|type)=="array" and
+      (.config.port|type)=="number" and .config.port>=1 and .config.port<=65535 and
+      (.mode!="single" or (.clients|length)<=1) and
+      ([.clients[].key]|length)==([.clients[].key]|unique|length) and
+      ([.clients[].name]|length)==([.clients[].name]|unique|length) and
+      all(.clients[]; (.key|type)=="string" and (.name|type)=="string" and
+        (.enabled|type)=="boolean" and (.account|type)=="object"))
+  ' "$1" >/dev/null
+}
+
+apply_inbound_state() {
+  local candidate="$1" runtime backup old_active=0
+  if ! validate_inbound_state "$candidate"; then
+    rm -f "$candidate"; fail '入站或客户端数据无效，未保存。'; return 1
+  fi
+  runtime="$(mktemp "$ETC_DIR/.inbound-runtime.XXXXXX.json")" || { rm -f "$candidate"; return 1; }
+  render_inbound_config "$candidate" > "$runtime" || { rm -f "$candidate" "$runtime"; return 1; }
+  backup="$(mktemp -d "$BACKUP_DIR/inbounds-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")" || { rm -f "$candidate" "$runtime"; return 1; }
+  cp -p "$CONFIG" "$INBOUNDS_FILE" "$NODE_HOSTS_FILE" "$NODE_META_FILE" "$backup/" || { rm -f "$candidate" "$runtime"; return 1; }
+  if [[ $# -ge 3 ]]; then
+    printf '%s\n' "$2" > "$backup/node-hosts.json" || { rm -f "$candidate" "$runtime"; return 1; }
+    printf '%s\n' "$3" > "$backup/node-meta.json" || { rm -f "$candidate" "$runtime"; return 1; }
+  fi
+  if service_is_active; then old_active=1; fi
+  if jq -e --slurpfile candidate "$runtime" '.==$candidate[0]' "$CONFIG" >/dev/null; then
+    rm -f "$runtime"
+  elif ! apply_config "$runtime"; then
+    rm -f "$candidate" "$runtime"; return 1
+  fi
+  if ! chmod 600 "$candidate" || ! mv -f "$candidate" "$INBOUNDS_FILE"; then
+    cp -p "$backup/config.json" "$CONFIG"
+    if ((old_active)); then service_restart || true; else service_stop >/dev/null 2>&1 || true; fi
+    rm -f "$candidate"; fail '管理数据保存失败，已恢复原运行配置。'; return 1
+  fi
+}
+
+client_records() {
+  get_inbound "$1" | jq -c '.clients[]'
+}
+
+get_client() {
+  local tag="$1" key="${2:-}" record
+  record="$(get_inbound "$tag")" || return 1
+  if [[ -z "$key" ]]; then
+    key="$(jq -er '([.clients[] | select(.enabled)] | if length==1 then .[0].key else empty end) //
+      (if (.clients|length)==1 then .clients[0].key else empty end)' <<< "$record")" || {
+      fail '此入站有多个客户端或尚无客户端，请先选择客户端。'; return 1;
+    }
+  fi
+  jq -ec --arg k "$key" '.clients[] | select(.key==$k)' <<< "$record"
+}
+
+list_clients() {
+  local record rows
+  record="$(get_inbound "$1")" || return 1
+  rows="$(jq -r '.clients | to_entries[] | [(.key+1|tostring),.value.name,
+    (if .value.enabled then "启用" else "停用" end)] | @tsv' <<< "$record")" || return 1
+  [[ -n "$rows" ]] || { say '暂无客户端；添加首个客户端后才会监听入站端口。'; return 0; }
+  printf '序号\t客户端名称\t状态\n%s\n' "$rows" |
+    { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
+}
+
+choose_client() {
+  local tag="$1" key name input n record
+  local -a keys=() names=()
+  record="$(get_inbound "$tag")" || return 1
+  while IFS= read -r key; do keys+=("$key"); done < <(jq -r '.clients[].key' <<< "$record")
+  while IFS= read -r name; do names+=("$name"); done < <(jq -r '.clients[].name' <<< "$record")
+  ((${#keys[@]})) || { say '此入站尚无客户端，请先在入站管理中添加。' >&2; return 2; }
+  if [[ "${2:-}" == auto && ${#keys[@]} -eq 1 ]]; then printf '%s\n' "${keys[0]}"; return 0; fi
+  list_clients "$tag" >&2
+  while :; do
+    read -r -p '选择客户端序号或名称（0 / 回车返回）：' input || return 2
+    [[ -n "$input" && "$input" != 0 ]] || return 2
+    for ((n=0;n<${#keys[@]};n++)); do
+      if [[ "$input" == "$((n+1))" || "$input" == "${names[n]}" || "$input" == "${keys[n]}" ]]; then
+        printf '%s\n' "${keys[n]}"; return 0
+      fi
+    done
+    warn '未找到此客户端。'
+  done
+}
+
+next_client_name() {
+  local tag="$1" n=1 record
+  record="$(get_inbound "$tag")" || return 1
+  while jq -e --arg name "客户端$n" 'any(.clients[]; .name==$name)' <<< "$record" >/dev/null; do ((n+=1)); done
+  printf '客户端%s\n' "$n"
+}
+
+valid_client_password() {
+  local method="$1" password="$2" size decoded
+  valid_proxy_credential "$password" password || return 1
+  [[ "$method" == 2022-* ]] || return 0
+  case "$method" in 2022-blake3-aes-128-gcm) size=16 ;; *) size=32 ;; esac
+  decoded="$(printf '%s' "$password" | base64 -d 2>/dev/null | wc -c)" || return 1
+  [[ "$decoded" -eq "$size" ]] && [[ "$password" != *:* ]]
+}
+
+new_client_account() {
+  local tag="$1" style="${2:-auto}" key="$3" record protocol method account username password uuid input
+  record="$(get_inbound "$tag")" || return 1
+  protocol="$(jq -r '.config.protocol' <<< "$record")"
+  method="$(jq -r '.config.settings.method // .clients[0].account.method // "aes-256-gcm"' <<< "$record")"
+  case "$protocol" in
+    vless)
+      uuid=''
+      if [[ "$style" == custom ]]; then read -r -p '客户端 UUID（回车自动生成）：' uuid || return 1; fi
+      [[ -n "$uuid" ]] || uuid="$("$CORE_LINK" uuid)" || return 1
+      [[ "$uuid" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || { fail 'UUID 格式无效。'; return 1; }
+      account="$(jq -n --arg id "$uuid" --arg email "$key@xnode" '{id:$id,flow:"xtls-rprx-vision",email:$email}')" || return 1
+      ;;
+    socks|http)
+      if [[ "$style" == custom ]]; then account="$(choose_proxy_credentials)" || return 1
+      else
+        username="user_$(openssl rand -hex 6)" || return 1
+        password="$(new_password "$protocol")" || return 1
+        account="$(jq -n --arg u "$username" --arg p "$password" '{user:$u,pass:$p}')" || return 1
+      fi
+      ;;
+    shadowsocks)
+      password=''
+      if [[ "$style" == custom ]]; then
+        IFS= read -r -p '客户端密码（明文显示，回车自动生成）：' password || return 1
+      fi
+      [[ -n "$password" ]] || password="$(new_password "$method")" || return 1
+      valid_client_password "$method" "$password" || { fail '密码无效；SS2022 需使用指定长度的 Base64 密钥（AES128 为 16 字节，其余为 32 字节）。'; return 1; }
+      account="$(jq -n --arg p "$password" --arg m "$method" --arg email "$key@xnode" '
+        {password:$p,email:$email} + (if ($m|startswith("2022-")) then {} else {method:$m} end)')" || return 1
+      ;;
+    *) fail '暂不支持此协议的客户端管理。'; return 1 ;;
+  esac
+  printf '%s\n' "$account"
+}
+
+add_client() {
+  local tag="$1" style="${2:-custom}" name default key account tmp record
+  record="$(get_inbound "$tag")" || return 1
+  if jq -e '.mode=="single" and (.clients|length)>0' <<< "$record" >/dev/null; then
+    fail '此 SS2022 入站只支持一个客户端。需多个客户端时，请新建 AES 入站；旧版单密码入站保留原链接格式。'; return 1
+  fi
+  default="$(next_client_name "$tag")" || return 1
+  name="$default"
+  if [[ "$style" == custom ]]; then
+    ui_title "添加客户端 → $(visible_node_name "$tag")"
+    read -r -p "客户端名称（回车使用 $default，0 返回）：" name || return 1
+    [[ "$name" != 0 ]] || return 2
+    name="${name:-$default}"
+  fi
+  safe_name "$name" || { fail '客户端名称需为 1～48 个字符，不能包含控制字符、斜杠或首尾空格。'; return 1; }
+  jq -e --arg n "$name" 'any(.clients[]; .name==$n)' <<< "$record" >/dev/null && { fail '此入站内的客户端名称已存在。'; return 1; }
+  key="c-$(openssl rand -hex 8)" || return 1
+  account="$(new_client_account "$tag" "$style" "$key")" || return 1
+  if jq -e --argjson a "$account" 'any(.clients[];
+    (.account.id!=null and (.account.id|ascii_downcase)==($a.id // ""|ascii_downcase)) or
+    (.account.user!=null and .account.user==$a.user) or
+    (.account.password!=null and .account.password==$a.password))' <<< "$record" >/dev/null; then
+    fail 'UUID、代理账号或 SS 密码与此入站已有客户端重复。'; return 1
+  fi
+  tmp="$(mktemp "$ETC_DIR/.client-add.XXXXXX.json")" || return 1
+  jq --arg t "$tag" --arg k "$key" --arg n "$name" --argjson a "$account" '
+    (.inbounds[] | select(.tag==$t) | .clients) += [{key:$k,name:$n,enabled:true,account:$a}]' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_inbound_state "$tmp" || return 1
+  info "已创建客户端：$name。"
+  show_node_connection "$tag" "$key"
+}
+
+toggle_inbound() {
+  local tag="$1" tmp
+  tmp="$(mktemp "$ETC_DIR/.inbound-toggle.XXXXXX.json")" || return 1
+  jq --arg t "$tag" '(.inbounds[] | select(.tag==$t) | .enabled) |= not' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_inbound_state "$tmp" || return 1
+  info '入站开关已更新，所有客户端凭据保留。'
+}
+
+update_client() {
+  local tag="$1" key="$2" action="$3" tmp name record yes
+  get_client "$tag" "$key" >/dev/null || return 1
+  tmp="$(mktemp "$ETC_DIR/.client-update.XXXXXX.json")" || return 1
+  case "$action" in
+    toggle)
+      jq --arg t "$tag" --arg k "$key" '(.inbounds[] | select(.tag==$t) | .clients[] | select(.key==$k) | .enabled) |= not' "$INBOUNDS_FILE" > "$tmp" ;;
+    rename)
+      read -r -p '新的客户端名称（0 返回）：' name || { rm -f "$tmp"; return 1; }
+      [[ "$name" != 0 ]] || { rm -f "$tmp"; return 2; }
+      safe_name "$name" || { rm -f "$tmp"; fail '客户端名称无效。'; return 1; }
+      record="$(get_inbound "$tag")" || { rm -f "$tmp"; return 1; }
+      if jq -e --arg n "$name" --arg k "$key" 'any(.clients[]; .name==$n and .key!=$k)' <<< "$record" >/dev/null; then
+        rm -f "$tmp"; fail '此客户端名称已存在。'; return 1
+      fi
+      jq --arg t "$tag" --arg k "$key" --arg n "$name" '(.inbounds[] | select(.tag==$t) | .clients[] | select(.key==$k) | .name)=$n' "$INBOUNDS_FILE" > "$tmp" ;;
+    delete)
+      read -r -p '删除此客户端后其链接将失效，输入“确认删除”继续：' yes || { rm -f "$tmp"; return 2; }
+      [[ "$yes" == 确认删除 ]] || { rm -f "$tmp"; return 2; }
+      jq --arg t "$tag" --arg k "$key" '(.inbounds[] | select(.tag==$t) | .clients) |= map(select(.key!=$k))' "$INBOUNDS_FILE" > "$tmp" ;;
+    *) rm -f "$tmp"; return 1 ;;
+  esac || { rm -f "$tmp"; return 1; }
+  apply_inbound_state "$tmp" || return 1
+  info '客户端设置已更新。'
+}
+
 next_node_name() {
   local n=1
-  while resolve_node_tag "节点$n" >/dev/null 2>&1; do ((n+=1)); done
-  printf '节点%s\n' "$n"
+  while resolve_node_tag "入站$n" >/dev/null 2>&1; do ((n+=1)); done
+  printf '入站%s\n' "$n"
 }
 
 add_node() {
   init_config || return 1
-  local name method='' default_name protocol endpoint sni='' credentials=''
-  ui_title '自定义创建节点'
+  local name method='' default_name protocol endpoint sni=''
+  ui_title '自定义创建：第 1 步 · 创建入站'
+  say '先设置协议、端口和连接地址，再为该入站添加客户端。'
   protocol="$(choose_protocol)" || return 1
   default_name="$(next_node_name)" || return 1
-  read -r -p "节点名称（支持中文，直接回车使用 $default_name）：" name || return 1
+  read -r -p "入站名称（支持中文，直接回车使用 $default_name）：" name || return 1
   name="${name:-$default_name}"
-  safe_name "$name" || { fail '节点名称无效：需为 1～48 个字符，不能包含控制字符、斜杠或首尾空格。'; return 1; }
+  safe_name "$name" || { fail '入站名称无效：需为 1～48 个字符，不能包含控制字符、斜杠或首尾空格。'; return 1; }
   if resolve_node_tag "$name" >/dev/null 2>&1; then
-    fail '该节点名称已存在（含旧版节点），请使用不同的名称。'; return 1
+    fail '该入站名称已存在（含旧版节点），请使用不同的名称。'; return 1
   fi
   if [[ "$protocol" == vless ]]; then
     sni="$(choose_reality_server)" || return 1
-  elif [[ "$protocol" == socks || "$protocol" == http ]]; then
-    credentials="$(choose_proxy_credentials)" || return 1
-  else
+  elif [[ "$protocol" == ss || "$protocol" == ss2022 ]]; then
     method="$(choose_method "$protocol")" || return 1
   fi
   endpoint="$(choose_connection_setup custom)" || return 1
   ensure_core_for_new_node || return 1
-  create_selected_node "$protocol" "$name" "$method" "$endpoint" "$sni" "$credentials"
+  CREATE_STYLE=custom create_selected_node "$protocol" "$name" "$method" "$endpoint" "$sni" '' || return 1
+  ui_title '自定义创建：第 2 步 · 添加客户端'
+  say '入站已保存；输入 0 可稍后在入站管理中添加客户端。'
+  add_client "$LAST_CREATED_TAG" custom
 }
 
 quick_add_node() {
   init_config || return 1
   ui_title '快速创建节点'
+  say '选择协议和网络环境后，自动创建一个入站和一个客户端，并生成连接链接。'
   local name protocol endpoint method=''
   protocol="$(choose_protocol)" || return 1
   name="$(next_node_name)" || return 1
   endpoint="$(choose_connection_setup auto)" || return 1
   case "$protocol" in ss) method="$DEFAULT_SS_METHOD" ;; ss2022) method="$DEFAULT_SS2022_METHOD" ;; esac
   ensure_core_for_new_node || return 1
-  create_selected_node "$protocol" "$name" "$method" "$endpoint" ''
+  CREATE_STYLE=quick create_selected_node "$protocol" "$name" "$method" "$endpoint" ''
 }
 
 choose_protocol() {
-  ui_title '选择节点协议' >&2
+  ui_title '选择入站协议' >&2
   ui_item 1 'SS（兼容常见客户端）' >&2
   ui_item 2 'SS2022（客户端需支持 Shadowsocks 2022）' >&2
   ui_item 3 'VLESS + Reality（自动生成 UUID 和密钥）' >&2
@@ -1184,7 +1480,7 @@ choose_connection_setup() {
       fail "本机端口 $port 已占用，无法创建同端口映射节点。"
       return 1
     fi
-    say "本机监听端口使用 $port；如需映射到其他本机端口，可在创建后通过 管理节点 → 修改本机监听端口 调整。" >&2
+    say "本机监听端口使用 $port；如需映射到其他本机端口，可在创建后通过 入站管理 → 修改本机监听端口 调整。" >&2
   elif [[ -n "$current_port" ]]; then
     port="$current_port"
   elif [[ "$style" == custom ]]; then
@@ -1219,14 +1515,17 @@ create_selected_node() {
 # 两种创建入口共用配置校验、地址保存和服务启动流程。
 create_node() {
   local name="$1" method="$2" port="$3" host="$4"
-  local tag="ss-$name" network='tcp,udp' pass node meta="${5:-}" listen
+  local tag="ss-$name" network='tcp,udp' pass node meta="${5:-}" listen server_pass
   listen="$(node_listen_address)"
 
-  # 每次仅创建一个带独立密码的节点；不再询问单用户/多用户模式。
   pass="$(new_password "$method")" || return 1
+  server_pass="$(new_password "$method")" || return 1
   node="$(jq -n --arg tag "$tag" --argjson port "$port" --arg method "$method" \
-    --arg pass "$pass" --arg network "$network" --arg listen "$listen" \
-    '{tag:$tag,listen:$listen,port:$port,protocol:"shadowsocks",settings:{method:$method,password:$pass,network:$network}}')" || return 1
+    --arg pass "$pass" --arg server "$server_pass" --arg network "$network" --arg listen "$listen" '
+    {tag:$tag,listen:$listen,port:$port,protocol:"shadowsocks",settings:{method:$method,network:$network}} |
+    if $method=="2022-blake3-chacha20-poly1305" then .settings.password=$pass
+    elif ($method|startswith("2022-")) then .settings += {password:$server,users:[{password:$pass}]}
+    else .settings.users=[{method:$method,password:$pass}] end')" || return 1
   [[ -n "$meta" ]] || meta='{}'
   commit_new_node "$tag" "$node" "$host" "$meta"
 }
@@ -1354,82 +1653,96 @@ create_reality_node() {
 }
 
 commit_new_node() {
-  local tag="$1" node="$2" host="$3" meta="$4" tmp port public_port traffic
-  if resolve_node_tag "${tag#*-}" >/dev/null 2>&1; then fail '节点名称已存在，请重新创建。'; return 1; fi
-  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")" || return 1
-  jq --argjson node "$node" '.inbounds += [$node]' "$CONFIG" > "$tmp" || { rm -f "$tmp"; return 1; }
-  if ! save_node_host "$tag" "$host"; then rm -f "$tmp"; return 1; fi
-  if ! save_node_meta "$tag" "$meta"; then remove_node_host "$tag"; rm -f "$tmp"; return 1; fi
+  local tag="$1" node="$2" host="$3" meta="$4" tmp probe record port public_port traffic old_hosts old_meta
+  if resolve_node_tag "${tag#*-}" >/dev/null 2>&1; then fail '入站名称已存在，请重新创建。'; return 1; fi
+  old_hosts="$(cat "$NODE_HOSTS_FILE")" || return 1
+  old_meta="$(cat "$NODE_META_FILE")" || return 1
+  record="$(inbound_record <<< "$node")" || return 1
+  if [[ "${CREATE_STYLE:-quick}" == custom ]]; then
+    record="$(jq '.clients=[]' <<< "$record")" || return 1
+  else
+    local client_key
+    client_key="c-$(openssl rand -hex 8)" || return 1
+    record="$(jq --arg key "$client_key" '.clients[0].key=$key |
+      if .config.protocol=="vless" or .config.protocol=="shadowsocks" then
+        .clients[0].account.email=($key+"@xnode") else . end' <<< "$record")" || return 1
+  fi
+  tmp="$(mktemp "$ETC_DIR/.inbound-add.XXXXXX.json")" || return 1
+  jq --argjson r "$record" '.inbounds += [$r]' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! save_node_host "$tag" "$host" || ! save_node_meta "$tag" "$meta"; then
+    restore_node_endpoints "$old_hosts" "$old_meta"; rm -f "$tmp"; return 1
+  fi
   if [[ "$tag" == vless-* ]]; then
+    probe="$(mktemp "$ETC_DIR/.reality-create.XXXXXX.json")" || { restore_node_endpoints "$old_hosts" "$old_meta"; rm -f "$tmp"; return 1; }
+    jq --argjson node "$node" '.inbounds += [$node]' "$CONFIG" > "$probe" || {
+      restore_node_endpoints "$old_hosts" "$old_meta"; rm -f "$tmp" "$probe"; return 1;
+    }
     info '正在用临时实例验证 Reality + Vision 握手和 HTTPS 代理请求……'
-    if ! CONFIG="$tmp" probe_reality_connection "$tag" isolated; then
-      remove_node_host "$tag" || warn '自检失败，节点地址记录未能清理。'
-      rm -f "$tmp"
-      warn 'Reality 实际连接自检失败，未创建节点。普通 TLS 1.3 可访问不代表兼容 Reality。'
+    if ! CONFIG="$probe" PROBE_NATIVE_NODE="$node" probe_reality_connection "$tag" isolated; then
+      restore_node_endpoints "$old_hosts" "$old_meta"
+      rm -f "$tmp" "$probe"
+      warn 'Reality 实际连接自检失败，未创建入站。'
       return 2
     fi
+    rm -f "$probe"
     info 'Reality + Vision 握手和 HTTPS 代理请求通过。'
   fi
-  if ! apply_config "$tmp"; then
-    remove_node_host "$tag" || warn '服务创建失败，节点地址记录未能清理。'
-    return 1
+  if ! apply_inbound_state "$tmp" "$old_hosts" "$old_meta"; then
+    restore_node_endpoints "$old_hosts" "$old_meta"; return 1
   fi
+  LAST_CREATED_TAG="$tag"
   port="$(jq -r .port <<< "$node")"
   public_port="$(node_public_port "$tag")" || return 1
   if [[ "$tag" == vless-* || "$tag" == socks5-* || "$tag" == http-* ]]; then traffic='TCP'; else traffic='TCP + UDP'; fi
-  info "已创建节点：$tag。"
-  warn "请在服务器防火墙中放行本机端口 $port（$traffic）。"
+  info "已创建入站：$(visible_node_name "$tag")。"
+  warn "请放行本机端口 $port 和公网端口 $public_port（$traffic）。"
   if jq -e '.nat==true' <<< "$meta" >/dev/null; then
     say "NAT 映射：公网 $host:$public_port → 本机监听端口 $port（$traffic）。"
-    say '请在服务商面板或路由器确认此映射已启用；脚本只配置本机和连接链接。'
-  else
-    say "请同时在服务商安全组中放行公网端口 $public_port（$traffic）。"
+    say '请在服务商面板或路由器确认此映射已启用。'
   fi
-  if show_node_connection "$tag"; then
-    if [[ "$tag" == socks5-* || "$tag" == http-* ]]; then
-      say '下一步：在客户端填写地址、端口和账号密码；支持此类链接的客户端也可直接导入。'
-    else
-      say '下一步：复制上面的完整链接，在客户端选择“从剪贴板导入”。'
-    fi
-    if [[ "$tag" == vless-* ]]; then say 'Reality 无法连接时，运行 sudo xnode diagnose 检查原因。'; fi
+  if [[ "${CREATE_STYLE:-quick}" == custom ]]; then
+    info '入站尚无客户端，暂不监听端口。'
   else
-    warn '节点已创建，但连接信息显示失败。可在主菜单 2 中重新查看。'
+    info '已自动创建客户端：客户端1。'
+    show_node_connection "$tag" || warn '连接信息显示失败，可在主菜单 2 中重新选择客户端查看。'
   fi
 }
 
 list_nodes() {
-  [[ -f "$CONFIG" ]] || { say '尚未创建配置文件。'; return 0; }
+  [[ -f "$INBOUNDS_FILE" ]] || { say '尚未创建配置文件。'; return 0; }
   local rows
   rows="$(jq -r --slurpfile meta "$NODE_META_FILE" '.inbounds | to_entries[] | .key as $i | .value |
-    [($i+1|tostring), (.tag | if startswith("xss-") then "ss-" + .[4:] else . end), (.port|tostring),
-     (($meta[0][.tag].public_port // .port)|tostring),
-     (if .protocol=="vless" then "VLESS+Reality" elif .protocol=="socks" then "SOCKS5"
-      elif .protocol=="http" then "HTTP" else (.settings.method // (.settings.users[0].method // "未知")) end)] | @tsv' "$CONFIG")" || return 1
-  [[ -n "$rows" ]] || { say '当前没有任何节点。主菜单选择 1 即可快速创建。'; return 0; }
-  {
-    printf '序号\t节点名称\t本机端口\t公网端口\t协议/加密\n'
-    printf '%s\n' "$rows"
-  } | { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
+    [.clients[] | select(.enabled)] as $active |
+    [($i+1|tostring), (.tag | if startswith("xss-") then "ss-" + .[4:] else . end),
+     (if (.enabled|not) then "停用" elif ($active|length)==0 then "待添加/启用客户端" else "启用" end),
+     (if .config.protocol=="vless" then "VLESS+Reality" elif .config.protocol=="socks" then "SOCKS5"
+      elif .config.protocol=="http" then "HTTP" else (.config.settings.method // "SS") end),
+     (.config.port|tostring), (($meta[0][.tag].public_port // .config.port)|tostring),
+     (($active|length|tostring)+"/"+(.clients|length|tostring))] | @tsv' "$INBOUNDS_FILE")" || return 1
+  [[ -n "$rows" ]] || { say '当前没有入站。主菜单 1 可快速创建，高级设置 1 可自定义创建。'; return 0; }
+  printf '序号\t入站名称\t状态\t协议/加密\t本机端口\t公网端口\t客户端(启用/总数)\n%s\n' "$rows" |
+    { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
+  say '状态为配置开关；服务是否运行请查看服务状态。'
 }
 
 choose_node() {
   local input tag n
   local -a tags=()
   [[ -f "$CONFIG" ]] || { say '当前没有任何节点。主菜单选择 1 即可快速创建。' >&2; return 2; }
-  while IFS= read -r tag; do tags+=("$tag"); done < <(jq -r '.inbounds[]?.tag' "$CONFIG")
+  while IFS= read -r tag; do tags+=("$tag"); done < <(jq -r '.inbounds[]?.tag' "$INBOUNDS_FILE")
   ((${#tags[@]})) || { say '当前没有任何节点。主菜单选择 1 即可快速创建。' >&2; return 2; }
   if [[ "${1:-}" == auto && ${#tags[@]} -eq 1 ]]; then
-    info "已自动选中唯一节点：$(visible_node_name "${tags[0]}")" >&2
+    info "已自动选中唯一入站：$(visible_node_name "${tags[0]}")" >&2
     printf '%s\n' "${tags[0]}"
     return 0
   fi
   list_nodes >&2 || return 1
   while :; do
     if ((${#tags[@]} == 1)); then
-      read -r -p '输入节点序号或名称（回车选中唯一节点，0 返回）：' input || return 2
+      read -r -p '输入入站序号或名称（回车选中唯一节点，0 返回）：' input || return 2
       input="${input:-1}"
     else
-      read -r -p '输入节点序号或名称（0 或直接回车返回）：' input || return 2
+      read -r -p '输入入站序号或名称（0 或直接回车返回）：' input || return 2
       [[ -n "$input" ]] || return 2
     fi
     [[ "$input" != 0 ]] || return 2
@@ -1439,8 +1752,8 @@ choose_node() {
         return 0
       fi
     done
-    if tag="$(resolve_node_tag "$input" 2>/dev/null)"; then printf '%s\n' "$tag"; return 0; fi
-    warn '未找到该节点，请输入列表中的序号或名称。'
+    if tag="$(resolve_node_tag "$input" 2>/dev/null)" && get_inbound "$tag" >/dev/null 2>&1; then printf '%s\n' "$tag"; return 0; fi
+    warn '未找到该入站，请输入列表中的序号或名称。'
   done
 }
 
@@ -1450,15 +1763,15 @@ change_port() {
   if [[ -z "$tag" ]]; then tag="$(choose_node)" || return 1; fi
   port="$(choose_port)" || return 1
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")"
-  jq --arg t "$tag" --argjson p "$port" '(.inbounds[] | select(.tag==$t) | .port)=$p' "$CONFIG" > "$tmp"
-  apply_config "$tmp" || return 1
+  jq --arg t "$tag" --argjson p "$port" '(.inbounds[] | select(.tag==$t) | .config.port)=$p' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_inbound_state "$tmp" || return 1
   warn "请在本机防火墙放行新监听端口 $port。"
   if jq -e --arg t "$tag" '.[$t].nat==true' "$NODE_META_FILE" >/dev/null; then
     say "请同步修改服务商/路由器映射：公网端口保持 $(node_public_port "$tag")，转发到新的本机端口 $port。"
   else
     say "请在服务商安全组中放行公网端口 $port，并重新复制更新后的链接。"
   fi
-  show_node_connection "$tag"
+  show_inbound_summary "$tag"
 }
 
 restore_node_endpoints() {
@@ -1475,7 +1788,7 @@ restore_node_endpoints() {
 
 change_node_endpoint() {
   local tag="$1" endpoint old_port port host old_hosts old_meta meta tmp
-  old_port="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.port' "$CONFIG")" || return 1
+  old_port="$(get_inbound "$tag" | jq -er '.config.port')" || return 1
   endpoint="$(choose_connection_setup address "$old_port")" || return 1
   host="$(jq -er .host <<< "$endpoint")" || return 1
   port="$(jq -er .port <<< "$endpoint")" || return 1
@@ -1485,29 +1798,30 @@ change_node_endpoint() {
   if ! save_node_host "$tag" "$host" || ! save_node_meta "$tag" "$meta"; then
     restore_node_endpoints "$old_hosts" "$old_meta"; return 1
   fi
-  if [[ "$port" != "$old_port" ]]; then
-    tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")" || { restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
-    jq --arg t "$tag" --argjson p "$port" '(.inbounds[]|select(.tag==$t)|.port)=$p' "$CONFIG" > "$tmp" || { rm -f "$tmp"; restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
-    if ! apply_config "$tmp"; then restore_node_endpoints "$old_hosts" "$old_meta"; return 1; fi
-  fi
-  info '节点公网地址和映射信息已更新。'
+  tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")" || { restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
+  jq --arg t "$tag" --argjson p "$port" '(.inbounds[]|select(.tag==$t)|.config.port)=$p' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; restore_node_endpoints "$old_hosts" "$old_meta"; return 1; }
+  if ! apply_inbound_state "$tmp" "$old_hosts" "$old_meta"; then restore_node_endpoints "$old_hosts" "$old_meta"; return 1; fi
+  info '入站公网地址和映射信息已更新，该入站所有客户端共用新地址。'
   if jq -e .nat <<< "$endpoint" >/dev/null; then
     say "请确认外部映射：公网 $host:$(node_public_port "$tag") → 本机端口 $port。"
   fi
-  show_node_connection "$tag"
+  show_inbound_summary "$tag"
 }
 
 delete_node() {
   need_core || return 1
   local tag="${1:-}" tmp yes
   if [[ -z "$tag" ]]; then tag="$(choose_node)" || return 1; fi
-  read -r -p "将删除节点 $(visible_node_name "$tag")，请输入 '确认删除' 以继续：" yes || return 2
+  read -r -p "将删除入站 $(visible_node_name "$tag") 及其全部客户端，输入 '确认删除' 继续：" yes || return 2
   [[ "$yes" == "确认删除" ]] || { info '已取消删除。'; return 2; }
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")"
-  jq --arg t "$tag" '.inbounds |= map(select(.tag!=$t))' "$CONFIG" > "$tmp"
-  if apply_config "$tmp"; then
+  if jq -e --arg t "$tag" 'any(.routing.rules[]?; any(.inboundTag[]?; .==$t))' "$CONFIG" >/dev/null; then
+    rm -f "$tmp"; fail '已有路由规则引用此入站，请先移除对应规则再删除。'; return 1
+  fi
+  jq --arg t "$tag" '.inbounds |= map(select(.tag!=$t))' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  if apply_inbound_state "$tmp"; then
     remove_node_host "$tag" || warn '节点已删除，但独立连接地址记录清理失败。'
-    info "已删除节点：$(visible_node_name "$tag")。"
+    info "已删除入站及其客户端：$(visible_node_name "$tag")。"
   else
     return 1
   fi
@@ -1931,7 +2245,11 @@ node_public_port() {
   if [[ -f "$NODE_META_FILE" ]]; then
     port="$(jq -er --arg t "$tag" '.[$t].public_port // empty' "$NODE_META_FILE")" || port=''
   fi
-  if [[ -z "$port" ]]; then port="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.port' "$CONFIG")" || return 1; fi
+  if [[ -z "$port" ]]; then
+    if [[ -n "${PROBE_NATIVE_NODE:-}" ]] && jq -e --arg t "$tag" '.tag==$t' <<< "$PROBE_NATIVE_NODE" >/dev/null; then
+      port="$(jq -er '.port' <<< "$PROBE_NATIVE_NODE")" || return 1
+    else port="$(get_inbound "$tag" | jq -er '.config.port')" || return 1; fi
+  fi
   normalize_port "$port" || { fail '节点公网端口无效。'; return 1; }
 }
 
@@ -1941,7 +2259,7 @@ node_reality_public_key() {
     key="$(jq -er --arg t "$tag" '.[$t].reality_public_key // empty' "$NODE_META_FILE")" || key=''
   fi
   if [[ -z "$key" ]]; then
-    private="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.streamSettings.realitySettings.privateKey' "$CONFIG")" || return 1
+    private="$(get_inbound "$tag" | jq -er '.config.streamSettings.realitySettings.privateKey')" || return 1
     if ! output="$("$CORE_LINK" x25519 -i "$private" 2>&1)" ||
        ! key="$(read_reality_key public <<< "$output")"; then
       fail '无法读取此节点的 Reality 公钥，请检查内核版本和密钥输出格式，不要提供私钥内容。'
@@ -1952,42 +2270,55 @@ node_reality_public_key() {
   printf '%s\n' "$key"
 }
 
+client_context() {
+  local tag="$1" key="${2:-}" record client
+  if [[ -n "${PROBE_NATIVE_NODE:-}" ]] && jq -e --arg t "$tag" '.tag==$t' <<< "$PROBE_NATIVE_NODE" >/dev/null; then
+    record="$(inbound_record <<< "$PROBE_NATIVE_NODE")" || return 1
+    client="$(jq -c '.clients[0]' <<< "$record")" || return 1
+  else
+    record="$(get_inbound "$tag")" || return 1
+    client="$(get_client "$tag" "$key")" || return 1
+  fi
+  jq -n --argjson r "$record" --argjson c "$client" --arg display "$(visible_node_name "$tag")" '
+    {record:$r,node:$r.config,client:$c,account:$c.account,
+     display:($display + (if ($r.clients|length)>1 then "/"+$c.name else "" end)),
+     method:($c.account.method // $r.config.settings.method // ""),
+     password:(if $r.config.protocol=="shadowsocks" and $r.mode=="multi" and
+       ($r.config.settings.method // "" | startswith("2022-")) then
+       $r.config.settings.password+":"+$c.account.password else $c.account.password end)}'
+}
+
 make_node_uri() {
-  local tag="$1" node host port display protocol method password uuid sni sid public label hostpart username scheme
-  node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CONFIG")" || return 1
+  local tag="$1" key="${2:-}" ctx host port display protocol method password uuid sni sid public label hostpart username scheme flow
+  ctx="$(client_context "$tag" "$key")" || return 1
   host="$(node_share_host "$tag")" || return 1
   port="$(node_public_port "$tag")" || return 1
-  display="$(visible_node_name "$tag")"
-  protocol="$(jq -r .protocol <<< "$node")"
+  display="$(jq -r '.display' <<< "$ctx")"
+  protocol="$(jq -r '.node.protocol' <<< "$ctx")"
+  hostpart="$host"; [[ "$host" != *:* ]] || hostpart="[$host]"
+  label="$(jq -rn --arg s "$display" '$s|@uri')"
   case "$protocol" in
     shadowsocks)
-      jq -e '.settings.users==null' <<< "$node" >/dev/null || { fail '旧版多用户节点请查看全部链接。'; return 1; }
-      method="$(jq -er .settings.method <<< "$node")" || return 1
-      password="$(jq -er .settings.password <<< "$node")" || return 1
+      method="$(jq -er '.method' <<< "$ctx")" || return 1
+      password="$(jq -er '.password' <<< "$ctx")" || return 1
       make_ss_uri "$method" "$password" "$host" "$port" "$display"
       ;;
     vless)
-      jq -e '.streamSettings.security=="reality" and (.settings.clients|length)==1' <<< "$node" >/dev/null || return 1
       public="$(node_reality_public_key "$tag")" || return 1
-      uuid="$(jq -er '.settings.clients[0].id' <<< "$node")" || return 1
-      sni="$(jq -er '.streamSettings.realitySettings.serverNames[0]' <<< "$node")" || return 1
-      sid="$(jq -er '.streamSettings.realitySettings.shortIds[0]' <<< "$node")" || return 1
-      sni="$(jq -rn --arg s "$sni" '$s|@uri')"
-      label="$(jq -rn --arg s "$display" '$s|@uri')"
-      hostpart="$host"; [[ "$host" != *:* ]] || hostpart="[$host]"
-      printf 'vless://%s@%s:%s?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision&sni=%s&fp=chrome&pbk=%s&sid=%s#%s\n' \
-        "$uuid" "$hostpart" "$port" "$sni" "$public" "$sid" "$label"
+      uuid="$(jq -er '.account.id' <<< "$ctx")" || return 1
+      sni="$(jq -er '.node.streamSettings.realitySettings.serverNames[0] | @uri' <<< "$ctx")" || return 1
+      sid="$(jq -r '.node.streamSettings.realitySettings.shortIds[0] // ""' <<< "$ctx")" || return 1
+      flow="$(jq -r '.account.flow // "" | @uri' <<< "$ctx")" || return 1
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&type=tcp&flow=%s&sni=%s&fp=chrome&pbk=%s&sid=%s#%s\n' \
+        "$uuid" "$hostpart" "$port" "$flow" "$sni" "$public" "$sid" "$label"
       ;;
     socks|http)
-      jq -e '(.settings.accounts | length)==1' <<< "$node" >/dev/null || return 1
-      username="$(jq -er '.settings.accounts[0].user | @uri' <<< "$node")" || return 1
-      password="$(jq -er '.settings.accounts[0].pass | @uri' <<< "$node")" || return 1
+      username="$(jq -er '.account.user | @uri' <<< "$ctx")" || return 1
+      password="$(jq -er '.account.pass | @uri' <<< "$ctx")" || return 1
       scheme="$protocol"; [[ "$protocol" != socks ]] || scheme=socks5
-      hostpart="$host"; [[ "$host" != *:* ]] || hostpart="[$host]"
-      label="$(jq -rn --arg s "$display" '$s|@uri')"
       printf '%s://%s:%s@%s:%s#%s\n' "$scheme" "$username" "$password" "$hostpart" "$port" "$label"
       ;;
-    *) fail '暂不支持此节点的分享链接。'; return 1 ;;
+    *) fail '暂不支持此入站的分享链接。'; return 1 ;;
   esac
 }
 
@@ -2024,173 +2355,131 @@ make_ss_uri() {
 }
 
 
-show_node_connection() {
-  local tag="$1" node display host port public_port uri protocol method network
-  node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CONFIG")" || return 1
-  uri="$(make_node_uri "$tag")" || return 1
+show_inbound_summary() {
+  local tag="$1" record host public_port
+  record="$(get_inbound "$tag")" || return 1
   host="$(node_share_host "$tag")" || return 1
-  port="$(jq -r .port <<< "$node")"
   public_port="$(node_public_port "$tag")" || return 1
-  display="$(visible_node_name "$tag")"
-  protocol="$(jq -r .protocol <<< "$node")"
-  say ''
-  say '========== 节点连接信息 =========='
-  say "节点名称：$display"
+  ui_title "入站详情：$(visible_node_name "$tag")"
+  say "入站标签：$tag"
+  say "协议：$(jq -r '.config.protocol' <<< "$record")"
+  say "监听地址：$(jq -r '.config.listen // "0.0.0.0"' <<< "$record")"
+  say "本机端口：$(jq -r '.config.port' <<< "$record")"
+  say "连接地址：$host；公网端口：$public_port"
+  if jq -e '.enabled' <<< "$record" >/dev/null; then say '入站开关：启用'; else say '入站开关：停用'; fi
+  if jq -e '.mode=="single"' <<< "$record" >/dev/null; then say '客户端容量：1（此 SS2022 入站使用单密码格式）'; fi
+  list_clients "$tag"
+}
+
+show_node_connection() {
+  local tag="$1" key="${2:-}" ctx host public_port uri protocol
+  if [[ -z "$key" ]]; then key="$(choose_client "$tag" auto)" || return $?; fi
+  ctx="$(client_context "$tag" "$key")" || return 1
+  uri="$(make_node_uri "$tag" "$key")" || return 1
+  host="$(node_share_host "$tag")" || return 1
+  public_port="$(node_public_port "$tag")" || return 1
+  protocol="$(jq -r '.node.protocol' <<< "$ctx")"
+  ui_title '客户端连接信息'
+  say "所属入站：$(visible_node_name "$tag")"
+  say "客户端名称：$(jq -r '.client.name' <<< "$ctx")"
   say "服务器地址：$host"
   say "公网访问端口：$public_port"
-  say "本机监听端口：$port"
-  if [[ "$protocol" == vless ]]; then
-    say '协议：VLESS + Reality'
-    say "用户 UUID：$(jq -r '.settings.clients[0].id' <<< "$node")"
-    say "Reality 伪装域名：$(jq -r '.streamSettings.realitySettings.serverNames[0]' <<< "$node")"
-    say "Reality 公钥：$(node_reality_public_key "$tag")"
-    say '传输方式：TCP；客户端需支持 Reality 和 Vision。'
-    say ''
-    say 'VLESS + Reality 分享链接（复制到客户端即可导入）：'
-  elif [[ "$protocol" == socks || "$protocol" == http ]]; then
-    if [[ "$protocol" == socks ]]; then say '协议：SOCKS5'; else say '协议：HTTP（支持 CONNECT）'; fi
-    say '传输方式：TCP；账号密码认证。'
-    say "代理账号：$(jq -r '.settings.accounts[0].user' <<< "$node")"
-    say "代理密码：$(jq -r '.settings.accounts[0].pass' <<< "$node")"
-    say ''
-    say '代理连接链接（客户端支持时可导入，也可手动填写地址、端口和账号密码）：'
-  else
-    method="$(jq -r .settings.method <<< "$node")"
-    if [[ "$method" == 2022-* ]]; then say '协议：SS2022'; else say '协议：SS'; fi
-    say "加密方式：$method"
-    network="$(jq -r '.settings.network // "tcp"' <<< "$node")"
-    case "$network" in tcp) say '传输方式：仅 TCP' ;; udp) say '传输方式：仅 UDP' ;; *) say '传输方式：TCP + UDP' ;; esac
-    say "连接密码：$(jq -r .settings.password <<< "$node")"
-    say ''
-    say 'SS / SS2022 分享链接（复制到客户端即可导入）：'
+  say "本机监听端口：$(jq -r '.node.port' <<< "$ctx")"
+  if ! jq -e '.record.enabled and .client.enabled' <<< "$ctx" >/dev/null; then
+    warn '此入站或客户端已停用；启用后此链接才可连接。'
   fi
+  case "$protocol" in
+    vless)
+      say '协议：VLESS + Reality；传输：TCP + Vision'
+      say "用户 UUID：$(jq -r '.account.id' <<< "$ctx")"
+      say "Reality 伪装域名：$(jq -r '.node.streamSettings.realitySettings.serverNames[0]' <<< "$ctx")"
+      say "Reality 公钥：$(node_reality_public_key "$tag")"
+      ;;
+    socks|http)
+      if [[ "$protocol" == socks ]]; then say '协议：SOCKS5；传输：TCP'; else say '协议：HTTP（支持 CONNECT）；传输：TCP'; fi
+      say "代理账号：$(jq -r '.account.user' <<< "$ctx")"
+      say "代理密码：$(jq -r '.account.pass' <<< "$ctx")"
+      ;;
+    shadowsocks)
+      say "加密方式：$(jq -r '.method' <<< "$ctx")"
+      say "连接密码：$(jq -r '.password' <<< "$ctx")"
+      say "传输方式：$(jq -r '.node.settings.network // "tcp"' <<< "$ctx")"
+      ;;
+  esac
+  say ''
+  say '客户端分享链接：'
   printf '%s\n' "$uri"
-  say '=================================='
   warn '分享链接包含连接凭据，请妥善保管。'
 }
 
-# 从节点真实入站配置生成可复制到 Xray outbounds 数组中的单个出站对象。
-# 使用 jq 构建 JSON，避免中文节点名、Base64 密钥等内容被手工拼接破坏。
-# 配置沿用 Xray 兼容的 settings.servers 形式，以便旧版 3x-ui 手动添加出站。
+# 按客户端生成单个出站对象，保留 IPv6、SS2022 服务端密钥和客户端凭据。
 make_node_outbound_json() {
-  local tag="$1" host json display_tag port protocol public
-  [[ -s "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
+  local tag="$1" key="${2:-}" ctx host port public=''
+  ctx="$(client_context "$tag" "$key")" || return 1
   host="$(node_share_host "$tag")" || return 1
   port="$(node_public_port "$tag")" || return 1
-  display_tag="$(visible_node_name "$tag")" || return 1
-  protocol="$(jq -er --arg t "$tag" '.inbounds[]|select(.tag==$t)|.protocol' "$CONFIG")" || return 1
-  if [[ "$protocol" == vless ]]; then
-    public="$(node_reality_public_key "$tag")" || return 1
-    jq -e --arg t "$tag" --arg host "$host" --argjson port "$port" --arg display "$display_tag" --arg public "$public" '
-      .inbounds[]|select(.tag==$t and .streamSettings.security=="reality" and (.settings.clients|length)==1)|
-      {tag:$display,protocol:"vless",settings:{vnext:[{address:$host,port:$port,
-        users:[{id:.settings.clients[0].id,encryption:"none",flow:(.settings.clients[0].flow // "xtls-rprx-vision")}]}]},
+  if jq -e '.node.protocol=="vless"' <<< "$ctx" >/dev/null; then public="$(node_reality_public_key "$tag")" || return 1; fi
+  jq -e --arg host "$host" --argjson port "$port" --arg public "$public" '
+    {tag:.display,protocol:.node.protocol} +
+    (if .node.protocol=="vless" then
+      {settings:{vnext:[{address:$host,port:$port,users:[{id:.account.id,encryption:"none",flow:(.account.flow // "")}]}]},
        streamSettings:{network:"tcp",security:"reality",realitySettings:{fingerprint:"chrome",publicKey:$public,
-         serverName:.streamSettings.realitySettings.serverNames[0],shortId:.streamSettings.realitySettings.shortIds[0]}}}' "$CONFIG"
-    return $?
-  fi
-  if [[ "$protocol" == socks || "$protocol" == http ]]; then
-    jq -e --arg t "$tag" --arg host "$host" --argjson port "$port" --arg display "$display_tag" '
-      .inbounds[] | select(.tag==$t and (.settings.accounts | length)==1) |
-      {tag:$display,protocol:.protocol,settings:{servers:[{address:$host,port:$port,
-        users:[{user:.settings.accounts[0].user,pass:.settings.accounts[0].pass}]}]}}' "$CONFIG"
-    return $?
-  fi
-  if ! jq -e --arg t "$tag" '
-      .inbounds[]? |
-      select(.tag==$t and .protocol=="shadowsocks" and .settings.users==null and
-             (.port|type)=="number" and (.settings.method|type)=="string" and
-             (.settings.password|type)=="string")
-    ' "$CONFIG" >/dev/null; then
-    fail '当前节点不是可导出的单用户 SS / SS2022 节点，无法生成出站 JSON。'
-    return 1
-  fi
-  # 出站 tag 与菜单显示的节点名称一致；兼容旧 xss- 节点的显示名 ss-。
-  display_tag="$(visible_node_name "$tag")" || return 1
-  json="$(jq -e --arg t "$tag" --arg host "$host" --argjson port "$port" --arg display_tag "$display_tag" '
-    .inbounds[]? |
-    select(.tag==$t and .protocol=="shadowsocks" and .settings.users==null) |
-    {
-      tag: $display_tag,
-      protocol: "shadowsocks",
-      settings: {
-        servers: [{
-          address: $host,
-          port: $port,
-          method: .settings.method,
-          password: .settings.password
-        }]
-      }
-    }
-  ' "$CONFIG")" || { fail '生成出站 JSON 失败。'; return 1; }
-  [[ -n "$json" ]] || { fail '生成出站 JSON 失败：未找到目标节点。'; return 1; }
-  printf '%s\n' "$json"
+         serverName:.node.streamSettings.realitySettings.serverNames[0],shortId:(.node.streamSettings.realitySettings.shortIds[0] // "")}}}
+     elif .node.protocol=="socks" or .node.protocol=="http" then
+      {settings:{servers:[{address:$host,port:$port,users:[{user:.account.user,pass:.account.pass}]}]}}
+     else {settings:{servers:[{address:$host,port:$port,method:.method,password:.password}]}} end)' <<< "$ctx"
 }
 
 show_node_outbound_json() {
-  local tag="$1" json
-  json="$(make_node_outbound_json "$tag")" || return 1
-  say ''
-  say '========== Xray 出站 JSON =========='
-  say "节点名称：$(visible_node_name "$tag")"
-  say '复制下面完整的 JSON 对象，添加到 3x-ui 的 Xray 配置 outbounds 数组中：'
+  local tag="$1" key="${2:-}" json
+  if [[ -z "$key" ]]; then key="$(choose_client "$tag" auto)" || return $?; fi
+  json="$(make_node_outbound_json "$tag" "$key")" || return 1
+  ui_title '客户端的 Xray 出站 JSON'
+  say "所属入站：$(visible_node_name "$tag")"
+  say '复制下面完整对象，添加到客户端 / 3x-ui 的 outbounds 数组：'
   printf '%s\n' "$json"
-  say '===================================' 
-  say '提示：这是一条出站对象，不是完整的 Xray 配置文件；如需走该出口，请配置相应路由。'
-  warn '出站 JSON 包含节点密码，请勿公开分享。'
+  warn 'JSON 包含连接凭据，请妥善保管。'
 }
 
 show_links() {
-  [[ -f "$CONFIG" ]] || { fail '尚未创建节点配置。'; return 1; }
-  if ! jq -e '.inbounds | length>0' "$CONFIG" >/dev/null; then
-    say '当前没有任何节点。主菜单选择 1 即可快速创建。'
-    return 0
-  fi
-  ui_title '节点分享链接'
-  say '复制 ss:// 或 vless:// 开头的完整一行，在客户端选择“从剪贴板导入”。'
-  if jq -e '.inbounds[]? | select(.protocol=="socks" or .protocol=="http")' "$CONFIG" >/dev/null; then
-    say 'SOCKS5 / HTTP 提供 socks5:// / http:// 链接；客户端不支持导入时，可在管理节点中查看账号密码手动配置。'
-  fi
-  local host tag display port method password nickname
-  while IFS=$'\t' read -r tag port method password nickname; do
-    [[ -n "$tag" ]] || continue
-    host="$(node_share_host "$tag")" || { warn "节点 $tag 的分享链接生成失败，已跳过。"; continue; }
-    port="$(node_public_port "$tag")" || continue
-    display="$(visible_node_name "$tag")"
-    if [[ "$nickname" == '节点' ]]; then
-      printf '\n%s\n' "$display"
-      make_ss_uri "$method" "$password" "$host" "$port" "$display"
-    else
-      printf '\n%s / %s\n' "$display" "$nickname"
-      make_ss_uri "$method" "$password" "$host" "$port" "$display-$nickname"
-    fi
-  done < <(jq -r '.inbounds[]? | select(.protocol=="shadowsocks") | . as $n | if (.settings.users | type)=="array" then .settings.users[] | [$n.tag, ($n.port|tostring), ($n.settings.method // .method), (if (($n.settings.method // "") | startswith("2022-")) then ($n.settings.password + ":" + .password) else .password end), (.email // "user")] | @tsv else [$n.tag, ($n.port|tostring), .settings.method, .settings.password, "节点"] | @tsv end' "$CONFIG")
-  while IFS= read -r tag; do
-    [[ -n "$tag" ]] || continue
-    printf '\n%s\n' "$(visible_node_name "$tag")"
-    make_node_uri "$tag" || warn "节点 $tag 的分享链接生成失败。"
-  done < <(jq -r '.inbounds[]?|select(.protocol=="vless" or .protocol=="socks" or .protocol=="http")|.tag' "$CONFIG")
-  warn '以上链接包含节点密钥，请妥善保管，不要公开传播。'
+  local tag key name failed=0 count=0 record
+  ui_title '全部启用客户端的分享链接'
+  say '每个客户端对应一条链接；停用入站和停用客户端不在批量导出中。'
+  while IFS= read -r record; do
+    tag="$(jq -r '.tag' <<< "$record")"
+    while IFS= read -r key; do
+      name="$(jq -r --arg k "$key" '.clients[] | select(.key==$k) | .name' <<< "$record")"
+      printf '\n%s / %s\n' "$(visible_node_name "$tag")" "$name"
+      make_node_uri "$tag" "$key" || failed=1
+      ((count+=1))
+    done < <(jq -r '.clients[] | select(.enabled) | .key' <<< "$record")
+  done < <(jq -c '.inbounds[] | select(.enabled)' "$INBOUNDS_FILE")
+  if ((count==0)); then say '当前没有启用的客户端。'; fi
+  warn '链接包含连接凭据，请妥善保管。'
+  return "$failed"
 }
 
 view_node_connections() {
-  local tag choice selection_status
+  local tag key selection_status
   if tag="$(choose_node auto)"; then :
-  else
-    selection_status=$?
-    [[ "$selection_status" == 2 ]] && return 0
-    return "$selection_status"
-  fi
+  else selection_status=$?; [[ "$selection_status" == 2 ]] && return 0; return "$selection_status"; fi
+  show_inbound_summary "$tag" || return 1
+  if key="$(choose_client "$tag" auto)"; then :
+  else selection_status=$?; [[ "$selection_status" == 2 ]] && return 0; return "$selection_status"; fi
+  client_menu "$tag" "$key" view
+}
+
+links_menu() {
+  local ans
   while :; do
-    say ''
-    ui_title "查看节点：$(visible_node_name "$tag")"
-    ui_item 1 '查看 SS / SS2022 / Reality / SOCKS5 / HTTP 连接链接'
-    ui_item 2 '查看 Xray 出站 JSON（用于 3x-ui 手动添加出站）'
+    ui_title '查看节点 / 复制链接'
+    ui_item 1 '按入站 → 客户端查看连接信息和出站 JSON'
+    ui_item 2 '批量显示全部启用客户端的链接'
     ui_back
-    read -r -p '请输入选项（1/2/0）：' choice || return 0
-    case "$choice" in
-      1) show_node_connection "$tag"; return $? ;;
-      2) show_node_outbound_json "$tag"; return $? ;;
+    read -r -p '请选择 [1-2 / 0]：' ans || return 0
+    case "$ans" in
+      1) view_node_connections || true ;;
+      2) show_links || true ;;
       0|'') return 0 ;;
       *) warn '请输入 1、2 或 0。' ;;
     esac
@@ -2233,10 +2522,13 @@ tcp_port_is_listening() {
 
 # 自检沿用实际导出的客户端参数，连接本机入站；NAT 公网地址不参与回环测试。
 make_reality_probe_config() {
-  local tag="$1" proxy_port node outbound address port
+  local tag="$1" proxy_port node outbound address port key=''
   proxy_port="$(normalize_port "$2")" || return 1
   node="$(jq -ec --arg t "$tag" '.inbounds[]|select(.tag==$t)' "$CONFIG")" || return 1
-  outbound="$(make_node_outbound_json "$tag")" || return 1
+  if [[ -z "${PROBE_NATIVE_NODE:-}" ]]; then
+    key="$(get_inbound "$tag" | jq -er '[.clients[]|select(.enabled)][0].key')" || return 1
+  fi
+  outbound="$(make_node_outbound_json "$tag" "$key")" || return 1
   jq -e '.protocol=="vless" and .streamSettings.security=="reality"' <<< "$outbound" >/dev/null || return 1
   address="$(jq -r '.listen // "0.0.0.0"' <<< "$node")"
   case "$address" in
@@ -2549,42 +2841,100 @@ uninstall_manager() {
 }
 
 menu_summary() {
-  local version='未安装' state='未运行' count=0
+  local version='未安装' state='未运行' counts='0 / 0'
   if [[ -x "$CORE_LINK" ]]; then
     version="$("$CORE_LINK" -version 2>/dev/null | awk 'NR==1 {print $2; exit}' || true)"
     version="${version:-已安装}"
     if service_is_active; then state='运行中'; fi
   fi
-  if [[ -f "$CONFIG" ]]; then count="$(jq -r '.inbounds | length' "$CONFIG" 2>/dev/null)" || count='未知'; fi
-  say "  内核：$version  ·  服务：$state  ·  节点：$count"
+  if [[ -f "$INBOUNDS_FILE" ]]; then
+    counts="$(jq -r '(.inbounds|length|tostring)+" / "+([.inbounds[].clients[]]|length|tostring)' "$INBOUNDS_FILE")" || counts='未知'
+  fi
+  say "  内核：$version  ·  服务：$state  ·  入站 / 客户端：$counts"
+}
+
+list_inbounds_tree() {
+  local record tag
+  ui_title '入站与客户端总览'
+  list_nodes || return 1
+  while IFS= read -r record; do
+    tag="$(jq -r '.tag' <<< "$record")"
+    ui_section "入站：$(visible_node_name "$tag")"
+    list_clients "$tag" || return 1
+  done < <(jq -c '.inbounds[]' "$INBOUNDS_FILE")
+  say '主菜单 2 可选择客户端查看链接；主菜单 4 可管理入站和客户端。'
+}
+
+client_menu() {
+  local tag="$1" key="$2" mode="${3:-manage}" ans name
+  while get_client "$tag" "$key" >/dev/null; do
+    name="$(get_client "$tag" "$key" | jq -r '.name')" || return 1
+    ui_title "客户端：$name → $(visible_node_name "$tag")"
+    ui_item 1 '查看连接信息 / 复制分享链接'
+    ui_item 2 '导出此客户端的 Xray 出站 JSON'
+    if [[ "$mode" == manage ]]; then
+      ui_item 3 '启用 / 停用此客户端'
+      ui_item 4 '修改客户端名称'
+      ui_text '31' '  5）删除此客户端'
+    fi
+    ui_back
+    read -r -p '请选择操作：' ans || return 0
+    case "$ans" in
+      1) show_node_connection "$tag" "$key" || true ;;
+      2) show_node_outbound_json "$tag" "$key" || true ;;
+      3) [[ "$mode" != manage ]] || update_client "$tag" "$key" toggle || true ;;
+      4) [[ "$mode" != manage ]] || update_client "$tag" "$key" rename || true ;;
+      5) if [[ "$mode" == manage ]] && update_client "$tag" "$key" delete; then return 0; fi ;;
+      0|'') return 0 ;;
+      *) warn '请输入菜单中的序号。' ;;
+    esac
+  done
+}
+
+clients_menu() {
+  local tag="$1" ans key result
+  while :; do
+    ui_title "客户端管理 → $(visible_node_name "$tag")"
+    list_clients "$tag" || return 1
+    ui_item 1 '添加客户端'
+    ui_item 2 '选择客户端（链接 / 出站 JSON / 开关 / 改名 / 删除）'
+    ui_back
+    read -r -p '请选择 [1-2 / 0]：' ans || return 0
+    case "$ans" in
+      1) add_client "$tag" custom || true ;;
+      2)
+        if key="$(choose_client "$tag" auto)"; then client_menu "$tag" "$key"
+        else result=$?; [[ "$result" == 2 ]] || return "$result"; fi ;;
+      0|'') return 0 ;;
+      *) warn '请输入 1、2 或 0。' ;;
+    esac
+  done
 }
 
 node_menu() {
   local tag ans selection_status
   if tag="$(choose_node auto)"; then :
-  else
-    selection_status=$?
-    [[ "$selection_status" == 2 ]] && return 0
-    return "$selection_status"
-  fi
+  else selection_status=$?; [[ "$selection_status" == 2 ]] && return 0; return "$selection_status"; fi
   while :; do
-    ui_title "管理节点：$(visible_node_name "$tag")"
-    ui_item 1 '查看连接信息 / 复制链接'
-    ui_item 2 '导出 Xray 出站 JSON（用于 3x-ui）'
+    ui_title "入站管理：$(visible_node_name "$tag")"
+    ui_item 1 '查看入站详情和客户端列表'
+    ui_item 2 '客户端管理（添加 / 链接 / 出站 JSON / 停用 / 删除）'
     ui_item 3 '修改本机监听端口'
     ui_item 4 '修改公网地址 / DDNS / NAT 映射'
-    ui_text '31' '  5）删除当前节点'
+    ui_item 5 '启用 / 停用整个入站'
+    ui_text '31' '  6）删除入站及全部客户端'
     ui_back '返回主菜单'
-    read -r -p '请选择 [1-5 / 0]：' ans || return 0
+    read -r -p '请选择 [1-6 / 0]：' ans || return 0
     case "$ans" in
-      1) show_node_connection "$tag" || true ;;
-      2) show_node_outbound_json "$tag" || true ;;
+      1) show_inbound_summary "$tag" || true ;;
+      2) clients_menu "$tag" || true ;;
       3) change_port "$tag" || true ;;
       4) change_node_endpoint "$tag" || true ;;
-      5) if delete_node "$tag"; then return 0; fi ;;
+      5) toggle_inbound "$tag" || true ;;
+      6) if delete_node "$tag"; then return 0; fi ;;
       0) return 0 ;;
       '') continue ;;
-      *) warn '请输入 1～5，或输入 0 返回。' ;;
+      *) warn '请输入 1～6，或输入 0 返回。' ;;
     esac
   done
 }
@@ -2630,7 +2980,7 @@ advanced_menu() {
   local ans tag
   while :; do
     ui_title '高级设置'
-    ui_item 1 '自定义创建节点（名称 / 加密 / 账号密码 / 端口 / 域名）'
+    ui_item 1 '自定义创建：先创建入站，再添加客户端'
     ui_item 2 "安装或切换 Xray 内核版本（默认 $DEFAULT_XRAY_VERSION）"
     ui_item 3 'DDNS 自动更新（Cloudflare / DuckDNS）'
     ui_item 4 '检测 Linux 系统兼容性'
@@ -2655,25 +3005,25 @@ advanced_menu() {
 menu() {
   local ans result
   while :; do
-    ui_title 'Xray 节点管理系统（SS / SS2022 / Reality / SOCKS5 / HTTP）'
+    ui_title 'Xray 管理系统 · 入站与客户端'
     menu_summary
     ui_section '常用操作'
-    ui_text '1;32' '  1）快速创建节点（SS / SS2022 / VLESS + Reality / SOCKS5 / HTTP）'
-    ui_item 2 '查看 / 复制分享链接'
-    ui_item 3 '查看已有节点'
+    ui_text '1;32' '  1）快速创建节点（自动创建入站 + 客户端）'
+    ui_item 2 '查看节点 / 复制链接（入站 → 客户端）'
+    ui_item 3 '入站与客户端总览（不显示密码）'
     ui_section '管理与维护'
-    ui_item 4 '管理节点（连接信息 / 出站 JSON / 地址与端口）'
+    ui_item 4 '入站与客户端管理'
     ui_item 5 '服务管理（状态 / 重启 / 日志）'
     ui_item 6 '高级设置（自定义创建 / 内核 / DDNS / 卸载）'
     ui_back '退出管理系统'
-    say '  新手：选 1 → 选协议和网络环境 → 复制链接导入客户端'
+    say '  连接节点 = 入站的地址和端口 + 客户端凭据；一个入站可管理多个客户端。'
     say '  NAT 请先查看服务商/路由器分配的端口；动态 IP 请选择 DDNS。'
     say ''
     read -r -p '请选择 [1-6 / 0]：' ans || return 0
     case "$ans" in
       1) quick_add_node || true ;;
-      2) show_links || true ;;
-      3) list_nodes || true ;;
+      2) links_menu || true ;;
+      3) list_inbounds_tree || true ;;
       4) node_menu || true ;;
       5) service_menu ;;
       6)
@@ -2696,10 +3046,12 @@ Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality / SOCKS5 / HTTP）
 用法：sudo bash xray-ss.sh    # 打开交互式中文菜单
       sudo xnode               # 首次安装后打开菜单
       sudo xnode add           # 选择协议和网络环境，快速创建节点
-      sudo xnode custom        # 自定义名称、加密方式、代理账号密码、端口及域名
-      sudo xnode links         # 查看所有节点分享链接
-      sudo xnode list          # 查看已有节点
-      sudo xnode show          # 选择节点，查看分享链接或出站 JSON
+      sudo xnode custom        # 先创建入站（协议 / 端口 / 地址），再添加客户端
+      sudo xnode links         # 批量导出全部启用客户端的分享链接
+      sudo xnode list          # 查看入站列表及客户端数量
+      sudo xnode show          # 按入站 → 客户端查看链接或出站 JSON
+      sudo xnode inbounds      # 管理入站和客户端
+      sudo xnode clients       # 选择入站，管理其中的客户端
       sudo xnode status        # 查看服务状态
       sudo xnode logs          # 查看运行日志
       sudo xnode logs on       # 开启警告 / 错误日志（默认关闭）
@@ -2749,6 +3101,7 @@ main() {
     diagnose)
       require_root || return 1
       detect_init_system || return 1
+      init_config || return 1
       diagnose_reality_nodes "${2:-}"
       return $? ;;
   esac
@@ -2762,6 +3115,8 @@ main() {
     custom) add_node ;;
     show) view_node_connections ;;
     list) list_nodes ;;
+    inbounds) node_menu ;;
+    clients) local tag; tag="$(choose_node auto)" && clients_menu "$tag" ;;
     status) status ;;
     logs) logs "${2:-show}" ;;
     ddns) ddns_menu ;;
