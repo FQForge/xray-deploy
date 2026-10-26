@@ -17,6 +17,7 @@ HOST_FILE="$ETC_DIR/host.txt"    # 旧版全局连接地址：仅用于读取旧
 NODE_HOSTS_FILE="$ETC_DIR/node-hosts.json"
 NODE_META_FILE="$ETC_DIR/node-meta.json"
 INBOUNDS_FILE="$ETC_DIR/inbounds.json"
+NETWORK_FILE="$ETC_DIR/network.json"
 DDNS_FILE="$ETC_DIR/ddns.json"
 DDNS_SERVICE_FILE="${XSS_DDNS_SERVICE_FILE:-/etc/systemd/system/xnode-ddns.service}"
 DDNS_TIMER_FILE="${XSS_DDNS_TIMER_FILE:-/etc/systemd/system/xnode-ddns.timer}"
@@ -310,7 +311,8 @@ init_config() {
     cp "${BASH_SOURCE[0]}" "$ENTRY"
     chmod 700 "$ENTRY"
   fi
-  init_inbound_store
+  init_inbound_store || return 1
+  init_network_store
 }
 
 service_daemon_reload() {
@@ -1161,6 +1163,7 @@ apply_inbound_state() {
   render_inbound_config "$candidate" > "$runtime" || { rm -f "$candidate" "$runtime"; return 1; }
   backup="$(mktemp -d "$BACKUP_DIR/inbounds-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")" || { rm -f "$candidate" "$runtime"; return 1; }
   cp -p "$CONFIG" "$INBOUNDS_FILE" "$NODE_HOSTS_FILE" "$NODE_META_FILE" "$backup/" || { rm -f "$candidate" "$runtime"; return 1; }
+  if [[ -f "$NETWORK_FILE" ]]; then cp -p "$NETWORK_FILE" "$backup/" || { rm -f "$candidate" "$runtime"; return 1; }; fi
   if [[ $# -ge 3 ]]; then
     printf '%s\n' "$2" > "$backup/node-hosts.json" || { rm -f "$candidate" "$runtime"; return 1; }
     printf '%s\n' "$3" > "$backup/node-meta.json" || { rm -f "$candidate" "$runtime"; return 1; }
@@ -1343,6 +1346,766 @@ update_client() {
   info '客户端设置已更新。'
 }
 
+# Parse supported share links without evaluating pasted text or adding a Python dependency.
+uri_decode() {
+  local value="$1" result='' byte prefix
+  while [[ "$value" == *%* ]]; do
+    prefix="${value%%\%*}"; result+="$prefix"; value="${value#*%}"
+    [[ "$value" =~ ^[a-fA-F0-9]{2} ]] || { fail '链接包含无效的百分号编码。'; return 1; }
+    [[ "${value:0:2}" != 00 ]] || { fail '链接不能包含 NUL 字符。'; return 1; }
+    printf -v byte '%b' "\\x${value:0:2}"
+    result+="$byte"; value="${value:2}"
+  done
+  printf '%s' "$result$value"
+}
+
+uri_base64_decode() {
+  local value="${1//-/+}"
+  value="${value//_/\/}"
+  case $((${#value}%4)) in 2) value+='==' ;; 3) value+='=' ;; 1) return 1 ;; esac
+  printf '%s' "$value" | base64 -d 2>/dev/null
+}
+
+uri_query_json() {
+  local query="$1" part key value result='{}'
+  local -a pairs=()
+  IFS='&' read -r -a pairs <<< "$query"
+  for part in "${pairs[@]}"; do
+    [[ -n "$part" ]] || continue
+    [[ "$part" == *=* ]] || { fail '链接查询参数需要 key=value 格式。'; return 1; }
+    key="$(uri_decode "${part%%=*}")" || return 1
+    value="$(uri_decode "${part#*=}")" || return 1
+    if jq -e --arg k "$key" 'has($k)' <<< "$result" >/dev/null; then fail '链接包含重复参数。'; return 1; fi
+    result="$(jq --arg k "$key" --arg v "$value" '.[$k]=$v' <<< "$result")" || return 1
+  done
+  printf '%s\n' "$result"
+}
+
+parse_outbound_uri() {
+  local uri="$1" scheme rest label='' query='' authority userinfo='' host port method password username uuid opts object tag security transport
+  [[ "$uri" != *$'\n'* && "$uri" == *://* ]] || { fail '请提供单行分享链接。'; return 1; }
+  scheme="${uri%%://*}"; rest="${uri#*://}"
+  case "$scheme" in ss|vless|socks|socks5|http|https) ;; *) fail '此链接协议暂不支持；可改为导入原生 Xray 出站 JSON。'; return 1 ;; esac
+  if [[ "$rest" == *'#'* ]]; then label="$(uri_decode "${rest#*#}")" || return 1; rest="${rest%%#*}"; fi
+  if [[ "$rest" == *'?'* ]]; then query="${rest#*\?}"; rest="${rest%%\?*}"; fi
+  rest="${rest%/}"
+  opts="$(uri_query_json "$query")" || return 1
+  if [[ "$scheme" == ss && "$rest" != *@* ]]; then rest="$(uri_base64_decode "$rest")" || { fail 'SS 链接的 Base64 无效。'; return 1; }; fi
+  if [[ "$rest" == *@* ]]; then userinfo="${rest%@*}"; authority="${rest##*@}"; else authority="$rest"; fi
+  if [[ "$authority" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+  elif [[ "$authority" =~ ^([^:/]+):([0-9]+)$ ]]; then host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+  else fail '链接地址需要 host:port；IPv6 使用 [地址]:端口。'; return 1; fi
+  host="$(uri_decode "$host")" || return 1
+  valid_share_host "$host" || { fail '链接中的服务器地址无效。'; return 1; }
+  port="$(normalize_port "$port")" || { fail '链接中的端口无效。'; return 1; }
+  tag="out-$(openssl rand -hex 8)" || return 1
+  [[ -n "$label" ]] || label="$scheme-$host:$port"
+  safe_name "$label" || label="$scheme-$port"
+  case "$scheme" in
+    ss)
+      [[ "$(jq 'length' <<< "$opts")" == 0 ]] || { fail 'SS 插件或查询参数暂不支持，请导入完整出站 JSON。'; return 1; }
+      userinfo="$(uri_decode "$userinfo")" || return 1
+      if [[ "$userinfo" != *:* ]]; then userinfo="$(uri_base64_decode "$userinfo")" || { fail 'SS 认证内容无效。'; return 1; }; fi
+      [[ "$userinfo" == *:* ]] || { fail 'SS 链接缺少加密方式和密码。'; return 1; }
+      method="${userinfo%%:*}"; password="${userinfo#*:}"
+      case "$method" in aes-128-gcm|aes-256-gcm|chacha20-poly1305|chacha20-ietf-poly1305|xchacha20-poly1305|xchacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) ;; *) fail 'SS 加密方式不受支持。'; return 1 ;; esac
+      valid_proxy_credential "$password" password || { fail 'SS 密码无效。'; return 1; }
+      object="$(jq -n --arg t "$tag" --arg h "$host" --argjson p "$port" --arg m "$method" --arg pass "$password" \
+        '{tag:$t,protocol:"shadowsocks",settings:{servers:[{address:$h,port:$p,method:$m,password:$pass}]}}')" || return 1 ;;
+    socks|socks5|http|https)
+      [[ "$(jq 'length' <<< "$opts")" == 0 ]] || { fail '代理链接查询参数暂不支持，请导入 JSON。'; return 1; }
+      username=''; password=''
+      if [[ -n "$userinfo" ]]; then
+        [[ "$userinfo" == *:* ]] || { fail '代理链接认证内容需要账号:密码。'; return 1; }
+        username="$(uri_decode "${userinfo%%:*}")" || return 1
+        password="$(uri_decode "${userinfo#*:}")" || return 1
+        valid_proxy_credential "$username" username && valid_proxy_credential "$password" password || { fail '代理账号或密码无效。'; return 1; }
+      fi
+      object="$(jq -n --arg t "$tag" --arg h "$host" --argjson p "$port" --arg scheme "$scheme" --arg u "$username" --arg pass "$password" '
+        {tag:$t,protocol:(if ($scheme=="socks" or $scheme=="socks5") then "socks" else "http" end),
+         settings:{servers:[({address:$h,port:$p} + (if $u!="" then {users:[{user:$u,pass:$pass}]} else {} end))]}} |
+        if $scheme=="https" then .streamSettings={network:"tcp",security:"tls",tlsSettings:{serverName:$h}} else . end')" || return 1 ;;
+    vless)
+      uuid="$(uri_decode "$userinfo")" || return 1
+      [[ "$uuid" =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ ]] || { fail 'VLESS UUID 无效。'; return 1; }
+      if ! jq -e '([keys[]]-["encryption","security","type","flow","sni","fp","pbk","sid","spx","alpn","path","host","serviceName","authority","mode"])|length==0' <<< "$opts" >/dev/null; then
+        fail 'VLESS 链接有尚未支持的参数，请使用完整出站 JSON 以保留设置。'; return 1
+      fi
+      security="$(jq -r '.security // "none"' <<< "$opts")"
+      transport="$(jq -r '.type // "tcp"' <<< "$opts")"
+      case "$security" in none|tls|reality) ;; *) fail '此 VLESS 安全类型需通过 JSON 导入。'; return 1 ;; esac
+      case "$transport" in tcp|raw|ws|grpc|httpupgrade|xhttp) ;; *) fail '此 VLESS 传输需通过 JSON 导入。'; return 1 ;; esac
+      jq -e '(.encryption // "none")=="none"' <<< "$opts" >/dev/null || { fail '此 VLESS 加密需通过 JSON 导入。'; return 1; }
+      if [[ "$security" == reality ]]; then
+        jq -e '(.pbk|type)=="string" and (.pbk|test("^[A-Za-z0-9_-]{43}$")) and
+          (.sni|type)=="string" and (.sni|length)>0 and ((.sid // "")|test("^([a-fA-F0-9]{2}){0,8}$"))' <<< "$opts" >/dev/null || { fail 'Reality 公钥、SNI 或 shortId 无效。'; return 1; }
+      fi
+      object="$(jq -n --arg t "$tag" --arg h "$host" --argjson p "$port" --arg id "$uuid" --argjson q "$opts" --arg sec "$security" --arg net "$transport" '
+        {tag:$t,protocol:"vless",settings:{vnext:[{address:$h,port:$p,users:[{id:$id,encryption:"none",flow:($q.flow // "")}]}]},
+         streamSettings:({network:$net,security:$sec} +
+           (if $sec=="reality" then {realitySettings:{serverName:$q.sni,publicKey:$q.pbk,shortId:($q.sid // ""),fingerprint:($q.fp // "chrome"),spiderX:($q.spx // "")}}
+            elif $sec=="tls" then {tlsSettings:({serverName:($q.sni // $h),fingerprint:($q.fp // "chrome")} +
+              (if $q.alpn then {alpn:($q.alpn|split(","))} else {} end))} else {} end) +
+           (if $net=="ws" then {wsSettings:{path:($q.path // "/"),headers:{Host:($q.host // $h)}}}
+            elif $net=="grpc" then {grpcSettings:{serviceName:($q.serviceName // ""),authority:($q.authority // ""),multiMode:($q.mode=="multi")}}
+            elif $net=="httpupgrade" then {httpupgradeSettings:{path:($q.path // "/"),host:($q.host // $h)}}
+            elif $net=="xhttp" then {xhttpSettings:{path:($q.path // "/"),host:($q.host // $h),mode:($q.mode // "auto")}}
+            else {} end))}')" || return 1 ;;
+  esac
+  jq -n --arg name "$label" --argjson object "$object" '[{name:$name,config:$object}]'
+}
+
+parse_outbound_input() {
+  local input objects
+  input="$(cat)" || return 1
+  ((${#input}<=2097152)) || { fail '导入内容超过 2 MB。'; return 1; }
+  if [[ "$input" =~ ^[a-zA-Z0-9]+:// ]]; then parse_outbound_uri "$input"; return $?; fi
+  objects="$(jq -ec '
+    if type=="array" then . elif type=="object" and (.outbounds|type)=="array" then .outbounds
+    elif type=="object" and (.protocol|type)=="string" then [.] else error("shape") end |
+    select(length>0) | if all(.[]; type=="object" and (.protocol|type)=="string") then . else error("object") end |
+    if length==0 then error("empty") else . end' <<< "$input" 2>/dev/null)" || { fail '请输入出站对象、出站数组、包含 outbounds 的 JSON 或支持的分享链接。'; return 1; }
+  jq -c '[.[] | {name:(.remark // .tag // .protocol),config:(del(.remark))}]' <<< "$objects"
+}
+
+# Network management keeps switches and names separate from Xray's native JSON.
+init_network_store() {
+  [[ ! -f "$NETWORK_FILE" ]] || { validate_network_shape "$NETWORK_FILE" || fail '网络管理数据无效，请恢复 network.json 备份。'; return $?; }
+  local tmp backup
+  tmp="$(mktemp "$ETC_DIR/.network-import.XXXXXX.json")" || return 1
+  if ! jq '
+    . as $c |
+    {schema_version:1,
+     outbounds:[(.outbounds // [])[] | {tag:.tag,name:(.tag // .protocol),enabled:true,config:.}],
+     rules:[(.routing.rules // []) | to_entries[] |
+       {key:("rule-import-"+(.key|tostring)),name:(.value.ruleTag // ("规则"+(.key+1|tostring))),enabled:true,config:.value}],
+     balancers:[(.routing.balancers // [])[] | . as $b |
+       {tag:.tag,name:.tag,enabled:true,config:.,
+        members:[$c.outbounds[] | .tag as $t | select(any($b.selector[]; . as $prefix | $t|startswith($prefix))) | .tag]}],
+     routing:((.routing // {})|del(.rules,.balancers)),
+     default:{outboundTag:(.outbounds[0].tag // "direct")},
+     observatory:(.observatory // null),burstObservatory:(.burstObservatory // null),
+     probe:{url:"https://www.gstatic.com/generate_204",interval:"30s"}}
+  ' "$CONFIG" > "$tmp"; then rm -f "$tmp"; return 1; fi
+  validate_network_shape "$tmp" || { rm -f "$tmp"; fail '原有网络配置缺少有效标签或存在重复项，请先检查。'; return 1; }
+  backup="$(mktemp -d "$BACKUP_DIR/before-network-import-XXXXXX")" || { rm -f "$tmp"; return 1; }
+  cp -p "$CONFIG" "$INBOUNDS_FILE" "$NODE_HOSTS_FILE" "$NODE_META_FILE" "$backup/" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" && mv -f "$tmp" "$NETWORK_FILE"
+}
+
+validate_network_shape() {
+  jq -e '
+    def unique_tags: ([.[].tag]|length)==([.[].tag]|unique|length);
+    def target: (has("outboundTag") != has("balancerTag")) and
+      ((.outboundTag // .balancerTag)|type=="string" and length>0);
+    .schema_version==1 and (.outbounds|type)=="array" and (.rules|type)=="array" and (.balancers|type)=="array" and
+    (.outbounds|unique_tags) and (.balancers|unique_tags) and
+    ([.rules[].key]|length)==([.rules[].key]|unique|length) and
+    (.routing|type)=="object" and (.default|target) and
+    all(.outbounds[]; (.tag|type)=="string" and (.tag|length)>0 and .tag==.config.tag and
+      (.name|type)=="string" and (.enabled|type)=="boolean" and (.config.protocol|type)=="string") and
+    all(.rules[]; (.key|type)=="string" and (.name|type)=="string" and (.enabled|type)=="boolean" and
+      (.config|type)=="object" and (.config|target)) and
+    all(.balancers[]; (.tag|type)=="string" and (.tag|length)>0 and .tag==.config.tag and
+      (.name|type)=="string" and (.enabled|type)=="boolean" and
+      (.members|type)=="array" and (.members|length)>0 and all(.members[];type=="string"))
+  ' "$1" >/dev/null
+}
+
+validate_network_state() {
+  local state="$1" known
+  validate_network_shape "$state" || { fail '网络配置结构、标签或规则目标无效。'; return 1; }
+  known="$(jq -s '[.[].inbounds[].tag]|unique' "$INBOUNDS_FILE" "$CONFIG")" || return 1
+  jq -e --argjson known "$known" '
+    . as $s | [.outbounds[]|select(.enabled)|.tag] as $outs |
+    [.balancers[]|select(.enabled)|.tag] as $groups |
+    def target_ok:
+      if has("outboundTag") then .outboundTag as $t | ($outs|index($t))!=null
+      else .balancerTag as $t | ($groups|index($t))!=null end;
+    (.default|target_ok) and
+    any(.outbounds[]; .tag=="direct" and .enabled and .config.protocol=="freedom") and
+    all(.outbounds[]|select(.enabled);
+      [(.config.proxySettings.tag // empty),(.config.streamSettings.sockopt.dialerProxy // empty)] |
+      all(.[]; . as $t|($outs|index($t))!=null)) and
+    all(.rules[]|select(.enabled);
+      (.config|target_ok) and all(.config.inboundTag[]?; . as $t|($known|index($t))!=null)) and
+    all(.balancers[]|select(.enabled);
+      . as $b | all(.members[]; . as $t|($outs|index($t))!=null) and
+      ((.config.fallbackTag // "") as $f | $f=="" or ($outs|index($f))!=null) and
+      ([$outs[] | . as $t | select(any($b.members[]; . as $p | $t|startswith($p)))]|sort)==(.members|unique|sort))
+  ' "$state" >/dev/null || {
+    fail '存在无效引用：默认出口、启用规则和均衡组必须引用启用的目标；均衡成员标签不能额外匹配其他出口。'; return 1;
+  }
+}
+
+render_network_config() {
+  jq --slurpfile state "$1" '
+    $state[0] as $s |
+    .outbounds=[$s.outbounds[]|select(.enabled)|.config] |
+    .routing=($s.routing + {rules:([$s.rules[]|select(.enabled)|.config] +
+      [($s.default+{type:"field",ruleTag:"xnode-default",network:"tcp,udp"})]),
+      balancers:[$s.balancers[]|select(.enabled)|. as $b|.config|.selector=$b.members]}) |
+    ([$s.balancers[]|select(.enabled and
+      ((.config.strategy.type // ""|ascii_downcase)=="leastping" or (.config.fallbackTag // "")!=""))|.members[]]|unique) as $monitor |
+    if $s.burstObservatory!=null then
+      .burstObservatory=$s.burstObservatory |
+      if ($monitor|length)>0 then .burstObservatory.subjectSelector=((.burstObservatory.subjectSelector // [])+$monitor|unique) else . end |
+      if $s.observatory!=null then .observatory=$s.observatory else del(.observatory) end
+    else
+      del(.burstObservatory) |
+      if $s.observatory!=null or ($monitor|length)>0 then
+        .observatory=($s.observatory // {probeURL:$s.probe.url,probeInterval:$s.probe.interval,enableConcurrency:true}) |
+        .observatory.subjectSelector=((.observatory.subjectSelector // [])+$monitor|unique)
+      else del(.observatory) end
+    end
+  ' "$CONFIG"
+}
+
+apply_network_state() {
+  local candidate="$1" runtime backup old_active=0
+  if ! validate_network_state "$candidate"; then rm -f "$candidate"; return 1; fi
+  ensure_core_for_new_node || { rm -f "$candidate"; return 1; }
+  runtime="$(mktemp "$ETC_DIR/.network-runtime.XXXXXX.json")" || { rm -f "$candidate"; return 1; }
+  render_network_config "$candidate" > "$runtime" || { rm -f "$candidate" "$runtime"; return 1; }
+  backup="$(mktemp -d "$BACKUP_DIR/network-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")" || { rm -f "$candidate" "$runtime"; return 1; }
+  cp -p "$CONFIG" "$NETWORK_FILE" "$INBOUNDS_FILE" "$NODE_HOSTS_FILE" "$NODE_META_FILE" "$backup/" || { rm -f "$candidate" "$runtime"; return 1; }
+  if service_is_active; then old_active=1; fi
+  if ! apply_runtime_config "$runtime" '网络配置已应用'; then rm -f "$candidate" "$runtime"; return 1; fi
+  if ! chmod 600 "$candidate" || ! mv -f "$candidate" "$NETWORK_FILE"; then
+    cp -p "$backup/config.json" "$CONFIG"
+    if ((old_active)); then service_restart || true; fi
+    rm -f "$candidate"; fail '网络管理数据保存失败，已恢复配置。'; return 1
+  fi
+}
+
+network_candidate() { mktemp "$ETC_DIR/.network-change.XXXXXX.json"; }
+
+network_add_outbounds() {
+  local parsed="$1" tmp item tag original name objects='[]' remap='{}' used
+  jq -e 'type=="array" and length>0 and all(.[]; type=="object" and (.config|type)=="object")' <<< "$parsed" >/dev/null 2>&1 || {
+    fail '出站导入内容为空或格式无效。'; return 1;
+  }
+  jq -e '[.[].config.tag|select(.!=null and .!="")]|length==(unique|length)' <<< "$parsed" >/dev/null || {
+    fail '同一批导入内容包含重复标签，请先修正 JSON。'; return 1;
+  }
+  used="$(jq '[.outbounds[].tag]' "$NETWORK_FILE")" || return 1
+  while IFS= read -r item; do
+    tag="$(jq -r '.config.tag // ""' <<< "$item")"
+    original="$tag"
+    [[ -n "$tag" ]] || tag="out-$(openssl rand -hex 8)" || return 1
+    if jq -e --arg t "$tag" 'index($t)!=null' <<< "$used" >/dev/null; then
+      tag="out-$(openssl rand -hex 8)" || return 1
+      info "导入标签 $original 已存在，已分配新标签 $tag。" >&2
+    fi
+    name="$(jq -r '.name // "出站"' <<< "$item")"
+    safe_name "$name" || name="$tag"
+    safe_name "$tag" || { fail '出站标签需为 1～48 个字符，不能包含斜杠或控制字符。'; return 1; }
+    objects="$(jq --arg t "$tag" --arg n "$name" --argjson item "$item" '.+[{tag:$t,name:$n,enabled:true,config:($item.config|.tag=$t)}]' <<< "$objects")" || return 1
+    used="$(jq --arg t "$tag" '.+[$t]' <<< "$used")" || return 1
+    if [[ -n "$original" ]]; then remap="$(jq --arg old "$original" --arg new "$tag" '.[$old]=$new' <<< "$remap")" || return 1; fi
+  done < <(jq -c '.[]' <<< "$parsed")
+  objects="$(jq --argjson remap "$remap" 'map(
+    if .config.proxySettings.tag then .config.proxySettings.tag=($remap[.config.proxySettings.tag] // .config.proxySettings.tag) else . end |
+    if .config.streamSettings.sockopt.dialerProxy then .config.streamSettings.sockopt.dialerProxy=
+      ($remap[.config.streamSettings.sockopt.dialerProxy] // .config.streamSettings.sockopt.dialerProxy) else . end)' <<< "$objects")" || return 1
+  tmp="$(network_candidate)" || return 1
+  jq --argjson objects "$objects" '.outbounds += $objects' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+network_add_rule() {
+  local name="$1" rule="$2" key="${3:-rule-$(openssl rand -hex 8)}" tmp
+  safe_name "$name" || { fail '规则名称无效。'; return 1; }
+  tmp="$(network_candidate)" || return 1
+  jq --arg k "$key" --arg n "$name" --argjson r "$rule" '.rules += [{key:$k,name:$n,enabled:true,config:($r|.type="field"|.ruleTag=$k)}]' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+network_add_balancer() {
+  local name="$1" members="$2" strategy="$3" fallback="${4:-}" tag="${5:-bal-$(openssl rand -hex 8)}" tmp
+  safe_name "$name" || { fail '均衡组名称无效。'; return 1; }
+  case "$strategy" in random|roundRobin|leastPing) ;; *) fail '策略需为 random、roundRobin 或 leastPing。'; return 1 ;; esac
+  tmp="$(network_candidate)" || return 1
+  jq --arg t "$tag" --arg n "$name" --argjson members "$members" --arg s "$strategy" --arg f "$fallback" '
+    .balancers += [{tag:$t,name:$n,enabled:true,members:$members,
+      config:({tag:$t,selector:$members,strategy:{type:$s}} + (if $f!="" then {fallbackTag:$f} else {} end))}]' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+network_update() {
+  local kind="$1" key="$2" action="$3" value="${4:-}" tmp
+  tmp="$(network_candidate)" || return 1
+  if ! jq --arg kind "$kind" --arg k "$key" --arg action "$action" --arg value "$value" '
+    def selected: if $kind=="rules" then .key==$k else .tag==$k end;
+    if any(.[$kind][];selected)|not then error("missing")
+    elif $action=="delete" then
+      if $kind=="outbounds" and ($k=="direct" or
+        .default.outboundTag==$k or any(.rules[];.config.outboundTag==$k) or
+        any(.balancers[];any(.members[];.==$k) or .config.fallbackTag==$k) or
+        any(.outbounds[]; .tag!=$k and (.config.proxySettings.tag==$k or .config.streamSettings.sockopt.dialerProxy==$k))) then error("referenced")
+      elif $kind=="balancers" and (.default.balancerTag==$k or any(.rules[];.config.balancerTag==$k)) then error("referenced")
+      else .[$kind] |= map(select(selected|not)) end
+    elif $action=="toggle" then
+      if $kind=="outbounds" and $k=="direct" then error("direct") else (.[$kind][]|select(selected)|.enabled) |= not end
+    elif $action=="rename" then (.[$kind][]|select(selected)|.name)=$value
+    elif $action=="config" then (.[$kind][]|select(selected)|.config)=($value|fromjson)
+    elif $action=="move" and $kind=="rules" then
+      (.rules|map(.key)|index($k)) as $from | ($value|tonumber) as $to |
+      if $to<0 or $to>=(.rules|length) then error("position") else
+        .rules[$from] as $rule | .rules |= (del(.[$from]) | .[:$to]+[$rule]+.[$to:]) end
+    else error("action") end
+  ' "$NETWORK_FILE" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; fail '无法修改：请检查选项、序号或引用关系；被规则、均衡组或默认出口引用的对象需先解除引用。'; return 1
+  fi
+  if [[ "$action" == rename ]]; then safe_name "$value" || { rm -f "$tmp"; fail '名称无效。'; return 1; }; fi
+  apply_network_state "$tmp"
+}
+
+network_set_default() {
+  local target="$1" tmp
+  tmp="$(network_candidate)" || return 1
+  jq --argjson target "$target" '.default=$target' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+get_network_item() {
+  jq -ec --arg kind "$1" --arg k "$2" '.[$kind][]|select((if $kind=="rules" then .key else .tag end)==$k)' "$NETWORK_FILE"
+}
+
+list_network_items() {
+  local kind="$1" rows
+  rows="$(jq -r --arg kind "$kind" '.[$kind]|to_entries[]|.key as $i|.value|
+    [($i+1|tostring),.name,(if .enabled then "启用" else "停用" end),
+      (if $kind=="outbounds" then .config.protocol+" / "+(.config.settings.servers[0].address // .config.settings.vnext[0].address // "本机")
+       elif $kind=="balancers" then (.config.strategy.type // "random")+" / "+(.members|join(","))
+       else ((.config.inboundTag // ["所有入站"]|join(","))+" / "+
+         (.config.domain // .config.ip // .config.user // [.config.port // .config.network // "全部目标"]|join(","))+" → "+
+         (.config.outboundTag // .config.balancerTag)) end),
+      (if $kind=="rules" then .key else .tag end)]|@tsv' "$NETWORK_FILE")" || return 1
+  [[ -n "$rows" ]] || { say '当前没有配置。'; return 0; }
+  printf '序号\t名称\t状态\t配置摘要\t标签\n%s\n' "$rows" | ui_table
+}
+
+choose_network_item() {
+  local kind="$1" input key record
+  list_network_items "$kind" >&2 || return 1
+  jq -e --arg kind "$kind" '.[$kind]|length>0' "$NETWORK_FILE" >/dev/null || return 2
+  while :; do
+    read -r -p '输入序号、标签或名称（0 / 回车返回）：' input || return 2
+    [[ -n "$input" && "$input" != 0 ]] || return 2
+    record="$(jq -c --arg kind "$kind" --arg input "$input" '[.[$kind]|to_entries[]|
+      select((.key+1|tostring)==$input or .value.tag==$input or .value.key==$input or .value.name==$input)|.value]|
+      if length==1 then .[0] else empty end' "$NETWORK_FILE")" || return 1
+    if [[ -n "$record" ]]; then
+      key="$(jq -r --arg kind "$kind" 'if $kind=="rules" then .key else .tag end' <<< "$record")"
+      printf '%s\n' "$key"; return 0
+    fi
+    warn '未找到唯一对象，请使用列表中的序号或标签。'
+  done
+}
+
+read_network_input() {
+  local line input=''
+  say '粘贴分享链接或 JSON，完整内容会自动识别；输入 0 取消。未自动识别时，可输入单独一行“结束”提交检查。' >&2
+  while IFS= read -r line; do
+    [[ "$line" != 0 || -n "$input" ]] || return 2
+    [[ "$line" != 结束 ]] || break
+    input+="${input:+$'\n'}$line"
+    if [[ "$input" =~ ^[a-zA-Z0-9]+:// ]] || jq -e . <<< "$input" >/dev/null 2>&1; then break; fi
+    ((${#input}<=2097152)) || { fail '导入内容超过 2 MB。'; return 1; }
+  done
+  [[ -n "$input" ]] || return 2
+  printf '%s\n' "$input"
+}
+
+csv_json() {
+  jq -cn --arg value "$1" '$value|split(",")|map(gsub("^\\s+|\\s+$";""))|map(select(length>0))|unique'
+}
+
+choose_route_target() {
+  local answer tag
+  ui_item 1 '直连' >&2
+  ui_item 2 '拦截' >&2
+  ui_item 3 '指定出站' >&2
+  ui_item 4 '负载均衡组' >&2
+  ui_item 0 '返回' >&2
+  read -r -p '请选择流量去向 [1-4 / 0]：' answer || return 2
+  case "$answer" in
+    1) printf '%s\n' '{"outboundTag":"direct"}' ;;
+    2)
+      if ! jq -e 'any(.outbounds[];.tag=="blocked" and .enabled and .config.protocol=="blackhole")' "$NETWORK_FILE" >/dev/null; then
+        if jq -e 'any(.outbounds[];.tag=="blocked")' "$NETWORK_FILE" >/dev/null; then
+          fail 'blocked 标签已存在或被停用，请先在出站设置中处理。'; return 1
+        fi
+        network_add_outbounds '[{"name":"拦截","config":{"tag":"blocked","protocol":"blackhole","settings":{}}}]' >&2 || return 1
+      fi
+      printf '%s\n' '{"outboundTag":"blocked"}' ;;
+    3) tag="$(choose_network_item outbounds)" || return $?; jq -cn --arg tag "$tag" '{outboundTag:$tag}' ;;
+    4) tag="$(choose_network_item balancers)" || return $?; jq -cn --arg tag "$tag" '{balancerTag:$tag}' ;;
+    *) return 2 ;;
+  esac
+}
+
+import_outbounds_menu() {
+  local input parsed answer selection
+  input="$(read_network_input)" || return $?
+  parsed="$(parse_outbound_input <<< "$input")" || return 1
+  say '识别到以下出站（凭据隐藏）：'
+  jq -r 'to_entries[]|[(.key+1|tostring),.value.name,.value.config.protocol,
+    (.value.config.settings.servers[0].address // .value.config.settings.vnext[0].address // "本机"),
+    (.value.config.settings.servers[0].port // .value.config.settings.vnext[0].port // ""|tostring)]|@tsv' <<< "$parsed" | ui_table
+  read -r -p '导入序号（英文逗号分隔，回车全部，0 取消）：' selection || return 2
+  [[ "$selection" != 0 ]] || return 2
+  if [[ -n "$selection" ]]; then
+    parsed="$(jq -ec --arg input "$selection" '
+      . as $items | ($input|split(",")|map(gsub("^\\s+|\\s+$";"")|tonumber-1)) as $ids |
+      if all($ids[];.>=0 and .<($items|length) and floor==.) then [$ids|unique[]|$items[.]] else error("selection") end' <<< "$parsed" 2>/dev/null)" || { fail '导入序号无效。'; return 1; }
+  fi
+  read -r -p '是否导入以上全部出站？[Y/n]：' answer || return 2
+  case "$answer" in n|N|0) return 2 ;; esac
+  network_add_outbounds "$parsed"
+}
+
+probe_outbound() (
+  local tag="$1" url="${2:-https://www.bing.com/}" record tmp pid='' port result
+  record="$(get_network_item outbounds "$tag")" || return 1
+  [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || { fail '探测地址需为有效 HTTP / HTTPS URL。'; return 1; }
+  tmp="$(mktemp -d "$ETC_DIR/.outbound-probe.XXXXXX")" || return 1
+  trap 'if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; rm -rf "$tmp"' EXIT
+  port="$(choose_port auto)" || return 1
+  jq --argjson record "$record" --argjson port "$port" --slurpfile network "$NETWORK_FILE" '
+    .log={loglevel:"none",access:"none",error:"none",dnsLog:false} |
+    .inbounds=[{tag:"outbound-test",listen:"127.0.0.1",port:$port,protocol:"socks",settings:{auth:"noauth",udp:false}}] |
+    .outbounds=([$record.config]+[$network[0].outbounds[]|select(.enabled and .tag!=$record.tag)|.config]) |
+    .routing={rules:[{type:"field",network:"tcp,udp",outboundTag:$record.tag}]} |
+    del(.observatory,.burstObservatory,.api,.stats)
+  ' "$CONFIG" > "$tmp/client.json" || return 1
+  "$CORE_LINK" run -test -config "$tmp/client.json" > "$tmp/check.log" 2>&1 || { fail '此出站测试配置未通过内核校验。'; return 1; }
+  "$CORE_LINK" run -config "$tmp/client.json" > "$tmp/client.log" 2>&1 & pid=$!
+  wait_reality_probe_ready "$pid" "$port" || { fail '无法启动临时出站测试。'; return 1; }
+  if result="$(curl -sS --noproxy '' --proxy "socks5h://127.0.0.1:$port" --connect-timeout 8 --max-time 20 \
+    --head --output /dev/null --write-out 'HTTP %{http_code} / %{time_total}s' "$url" 2>/dev/null)"; then
+    info "出站 $(jq -r '.name' <<< "$record") 连接成功：$result"
+  else fail "出站 $(jq -r '.name' <<< "$record") 连接失败。"; return 1; fi
+)
+
+outbound_details() {
+  local tag="$1" item
+  item="$(get_network_item outbounds "$tag")" || return 1
+  jq -r '"名称："+.name,"标签："+.tag,"协议："+.config.protocol,
+    "开关："+(if .enabled then "启用" else "停用" end),
+    "服务器："+(.config.settings.servers[0].address // .config.settings.vnext[0].address // "本机"),
+    "端口："+(.config.settings.servers[0].port // .config.settings.vnext[0].port // "无"|tostring),
+    "传输："+(.config.streamSettings.network // "tcp"),"安全设置："+(.config.streamSettings.security // "none")' <<< "$item"
+}
+
+manage_outbound() {
+  local tag="$1" answer input parsed value
+  while get_network_item outbounds "$tag" >/dev/null; do
+    ui_title '管理服务器出站'
+    outbound_details "$tag"
+    ui_item 1 '测试此出站连接'
+    ui_item 2 '修改显示名称'
+    ui_item 3 '用链接 / JSON 替换连接参数（保留标签）'
+    ui_item 4 '启用 / 停用'
+    ui_item 5 '导出完整出站 JSON（含凭据）'
+    ui_item 6 '删除出站'
+    ui_back
+    read -r -p '请选择 [1-6 / 0]：' answer || return 0
+    case "$answer" in
+      1) probe_outbound "$tag" || true ;;
+      2) read -r -p '新的显示名称：' value && network_update outbounds "$tag" rename "$value" || true ;;
+      3)
+        if input="$(read_network_input)" && parsed="$(parse_outbound_input <<< "$input")" && jq -e 'length==1' <<< "$parsed" >/dev/null; then
+          value="$(jq -c --arg tag "$tag" '.[0].config|.tag=$tag' <<< "$parsed")" || continue
+          network_update outbounds "$tag" config "$value" || true
+        else warn '替换操作需要一条有效的链接或一个出站对象。'; fi ;;
+      4) network_update outbounds "$tag" toggle || true ;;
+      5) get_network_item outbounds "$tag" | jq '.config'; warn '完整 JSON 包含凭据，请妥善保管。' ;;
+      6) read -r -p '输入“确认删除”继续：' value || return 0
+        if [[ "$value" == 确认删除 ]] && network_update outbounds "$tag" delete; then return 0; fi ;;
+      0|'') return 0 ;;
+      *) warn '请输入菜单中的序号。' ;;
+    esac
+  done
+}
+
+outbound_menu() {
+  local answer tag
+  while :; do
+    ui_title '服务器出站设置'
+    list_network_items outbounds
+    ui_item 1 '导入协议链接 / JSON（支持出站数组和完整 Xray JSON）'
+    ui_item 2 '管理出站（测试 / 修改 / 开关 / 导出 / 删除）'
+    ui_back
+    read -r -p '请选择 [1-2 / 0]：' answer || return 0
+    case "$answer" in
+      1) import_outbounds_menu || true ;;
+      2) if tag="$(choose_network_item outbounds)"; then manage_outbound "$tag"; fi ;;
+      0|'') return 0 ;;
+      *) warn '请输入 1、2 或 0。' ;;
+    esac
+  done
+}
+
+rule_wizard() {
+  local existing="${1:-}" name input sources domains ips ports network target rule client='' email='' key tmp
+  read -r -p '规则名称：' name || return 2
+  safe_name "$name" || { fail '规则名称无效。'; return 1; }
+  list_nodes >&2
+  read -r -p '来源入站标签（多个用英文逗号分隔，回车表示所有入站）：' input || return 2
+  sources="$(csv_json "$input")" || return 1
+  read -r -p '是否进一步限定客户端？[y/N]：' input || return 2
+  if [[ "$input" == y || "$input" == Y ]]; then
+    [[ "$(jq 'length' <<< "$sources")" == 1 ]] || { fail '限定客户端时请选择一个来源入站。'; return 1; }
+    input="$(jq -r '.[0]' <<< "$sources")"
+    client="$(choose_client "$input" auto)" || return $?
+    email="$(get_client "$input" "$client" | jq -er '.account.email // empty')" || { fail '此协议没有可用于路由识别的客户端身份，请按入站分流。'; return 1; }
+  fi
+  read -r -p '目标域名（逗号分隔，支持 domain:/full:/regexp:/keyword:/geosite:，回车不限）：' input || return 2
+  domains="$(csv_json "$input" | jq 'map(if startswith("keyword:") then .[8:] elif contains(":") then . else "domain:"+. end)')" || return 1
+  read -r -p '目标 IP / CIDR（逗号分隔，支持 IPv4/IPv6/geoip:，回车不限）：' input || return 2
+  ips="$(csv_json "$input")" || return 1
+  read -r -p '目标端口（如 80,443 或 1000-2000，回车不限）：' ports || return 2
+  read -r -p '网络类型 [tcp/udp，回车表示 tcp,udp]：' network || return 2
+  network="${network:-tcp,udp}"
+  case "$network" in tcp|udp|tcp,udp) ;; *) fail '网络类型需为 tcp、udp 或 tcp,udp。'; return 1 ;; esac
+  target="$(choose_route_target)" || return $?
+  rule="$(jq -cn --argjson src "$sources" --argjson domain "$domains" --argjson ip "$ips" --arg port "$ports" \
+    --arg net "$network" --arg email "$email" --argjson target "$target" '
+      {type:"field",network:$net}+$target+
+      (if ($src|length)>0 then {inboundTag:$src} else {} end)+
+      (if ($domain|length)>0 then {domain:$domain} else {} end)+
+      (if ($ip|length)>0 then {ip:$ip} else {} end)+
+      (if $port!="" then {port:$port} else {} end)+
+      (if $email!="" then {user:[$email]} else {} end)')" || return 1
+  if [[ -z "$existing" ]]; then network_add_rule "$name" "$rule"
+  else
+    tmp="$(network_candidate)" || return 1
+    jq --arg k "$existing" --arg n "$name" --argjson rule "$rule" '(.rules[]|select(.key==$k)) |= (.name=$n|.config=($rule|.ruleTag=$k))' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    apply_network_state "$tmp"
+  fi
+}
+
+import_rules() {
+  local input="$1" rules tmp default_target routing_options
+  rules="$(jq -ec 'if type=="array" then . elif (.routing.rules|type)=="array" then .routing.rules
+    elif (.rules|type)=="array" then .rules elif type=="object" and (has("outboundTag") or has("balancerTag")) then [.] else error("shape") end|
+    if length>0 and all(.[];type=="object") then . else error("rules") end' <<< "$input" 2>/dev/null)" || { fail '需要规则对象、规则数组或包含 routing.rules 的 JSON。'; return 1; }
+  tmp="$(network_candidate)" || return 1
+  local prefix
+  prefix="rule-$(openssl rand -hex 8)" || { rm -f "$tmp"; return 1; }
+  default_target="$(jq -c '[.[]|select(.ruleTag=="xnode-default")][-1] // null |
+    if .==null then null else {outboundTag,balancerTag}|with_entries(select(.value!=null)) end' <<< "$rules")" || { rm -f "$tmp"; return 1; }
+  routing_options="$(jq -c 'if type=="object" then (.routing // .)|{domainStrategy}|with_entries(select(.value!=null)) else {} end' <<< "$input")" || { rm -f "$tmp"; return 1; }
+  jq --argjson rules "$rules" --arg prefix "$prefix" --argjson default "$default_target" --argjson options "$routing_options" '
+    .routing += $options | if $default!=null then .default=$default else . end |
+    .rules += [$rules|map(select(.ruleTag!="xnode-default"))|to_entries[]|. as $r|
+    {key:($prefix+"-"+(.key|tostring)),name:(.value.ruleTag // ("导入规则"+(.key+1|tostring))),enabled:true,
+      config:(.value|.ruleTag=($prefix+"-"+($r.key|tostring)))}]' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+manage_rule() {
+  local key="$1" answer value item count
+  while item="$(get_network_item rules "$key")"; do
+    ui_title "管理规则：$(jq -r '.name' <<< "$item")"
+    jq '.config' <<< "$item"
+    ui_item 1 '通过向导重新编辑'
+    ui_item 2 '编辑原生规则 JSON'
+    ui_item 3 '启用 / 停用'
+    ui_item 4 '修改名称'
+    ui_item 5 '移动到指定序号（1 为最高优先级）'
+    ui_item 6 '复制规则'
+    ui_item 7 '删除规则'
+    ui_back
+    read -r -p '请选择 [1-7 / 0]：' answer || return 0
+    case "$answer" in
+      1) rule_wizard "$key" || true ;;
+      2) if value="$(read_network_input)" && jq -e 'type=="object"' <<< "$value" >/dev/null 2>&1; then
+        value="$(jq -c --arg k "$key" '.ruleTag=$k' <<< "$value")" || continue
+        network_update rules "$key" config "$value" || true; fi ;;
+      3) network_update rules "$key" toggle || true ;;
+      4) read -r -p '新的规则名称：' value && network_update rules "$key" rename "$value" || true ;;
+      5)
+        read -r -p '新的规则序号：' value || return 0
+        count="$(jq '.rules|length' "$NETWORK_FILE")"
+        if [[ "$value" =~ ^[0-9]{1,6}$ ]] && ((10#$value>=1 && 10#$value<=count)); then network_update rules "$key" move "$((10#$value-1))" || true
+        else warn '请输入规则列表中的序号。'; fi ;;
+      6) network_add_rule "$(jq -r '.name|.[0:36]' <<< "$item") 副本" "$(jq -c '.config' <<< "$item")" || true ;;
+      7) network_update rules "$key" delete && return 0 ;;
+      0|'') return 0 ;;
+      *) warn '请输入菜单中的序号。' ;;
+    esac
+  done
+}
+
+set_routing_strategy() {
+  local choice strategy tmp
+  ui_item 1 'AsIs：域名按域名规则匹配'
+  ui_item 2 'IPIfNonMatch：域名规则未命中时解析 IP 再匹配'
+  ui_item 3 'IPOnDemand：遇到 IP 规则时解析域名'
+  read -r -p '请选择 [1-3 / 0]：' choice || return 2
+  case "$choice" in 1) strategy=AsIs ;; 2) strategy=IPIfNonMatch ;; 3) strategy=IPOnDemand ;; *) return 2 ;; esac
+  tmp="$(network_candidate)" || return 1
+  jq --arg strategy "$strategy" '.routing.domainStrategy=$strategy' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+set_inbound_sniffing() {
+  local tag answer tmp
+  tag="$(choose_node auto)" || return $?
+  read -r -p '启用 HTTP / TLS / QUIC 域名嗅探用于分流？[y/N]：' answer || return 2
+  tmp="$(mktemp "$ETC_DIR/.sniffing.XXXXXX.json")" || return 1
+  jq --arg t "$tag" --arg answer "$answer" '(.inbounds[]|select(.tag==$t)|.config.sniffing)=
+    {enabled:($answer=="y" or $answer=="Y"),destOverride:["http","tls","quic"],routeOnly:true}' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_inbound_state "$tmp"
+}
+
+check_network_rules() {
+  local tmp
+  validate_network_state "$NETWORK_FILE" || return 1
+  tmp="$(mktemp "$ETC_DIR/.network-check.XXXXXX.json")" || return 1
+  render_network_config "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! "$CORE_LINK" run -test -config "$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+  info '规则引用和内核校验通过。规则从上往下匹配，第一条命中后生效。'
+  jq -r '[.rules[]|select(.enabled)] as $rules|
+    range(0;$rules|length) as $i | $rules[$i] as $r |
+    if any(range(0;$i); ($rules[.].config|del(.ruleTag))==($r.config|del(.ruleTag))) then "提示：规则 "+$r.name+" 与前面的规则重复。"
+    elif any(range(0;$i); ($rules[.].config|del(.type,.ruleTag,.outboundTag,.balancerTag))=={network:"tcp,udp"})
+    then "提示：规则 "+$r.name+" 前已有匹配所有流量的规则。" else empty end' "$NETWORK_FILE"
+}
+
+restore_network_backup() {
+  local path input n=0 tmp
+  local -a paths=()
+  while IFS= read -r path; do paths+=("$path"); done < <(compgen -G "$BACKUP_DIR/network-*/network.json" | sort -r)
+  ((${#paths[@]})) || { say '暂无网络配置备份。'; return 0; }
+  for path in "${paths[@]}"; do ((n+=1)); printf '%d）%s\n' "$n" "${path%/network.json}"; done
+  read -r -p '选择恢复序号（0 返回）：' input || return 2
+  [[ "$input" =~ ^[0-9]{1,6}$ ]] && ((10#$input>=1 && 10#$input<=${#paths[@]})) || return 2
+  tmp="$(network_candidate)" || return 1
+  cp "${paths[10#$input-1]}" "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+routing_menu() {
+  local answer key input target
+  while :; do
+    ui_title '路由规则（从上往下匹配）'
+    say "默认出口：$(jq -r '.default.outboundTag // .default.balancerTag' "$NETWORK_FILE")"
+    list_network_items rules
+    ui_item 1 '添加规则向导（入站 / 客户端 / 域名 / IP / 端口 / 网络）'
+    ui_item 2 '管理规则（编辑 / 开关 / 名称 / 排序 / 复制 / 删除）'
+    ui_item 3 '设置默认出口'
+    ui_item 4 '导入规则 JSON'
+    ui_item 5 '导出路由 JSON'
+    ui_item 6 '检查规则引用和配置'
+    ui_item 7 '域名解析策略'
+    ui_item 8 '入站 HTTP / TLS / QUIC 嗅探'
+    ui_item 9 '恢复网络配置备份'
+    ui_back
+    read -r -p '请选择 [1-9 / 0]：' answer || return 0
+    case "$answer" in
+      1) rule_wizard || true ;;
+      2) if key="$(choose_network_item rules)"; then manage_rule "$key"; fi ;;
+      3) if target="$(choose_route_target)"; then network_set_default "$target" || true; fi ;;
+      4) if input="$(read_network_input)"; then import_rules "$input" || true; fi ;;
+      5) render_network_config "$NETWORK_FILE" | jq '.routing' ;;
+      6) check_network_rules || true ;;
+      7) set_routing_strategy || true ;;
+      8) set_inbound_sniffing || true ;;
+      9) restore_network_backup || true ;;
+      0|'') return 0 ;;
+      *) warn '请输入菜单中的序号。' ;;
+    esac
+  done
+}
+
+balancer_wizard() {
+  local tag="${1:-bal-$(openssl rand -hex 8)}" name members input strategy fallback='' tmp
+  read -r -p '均衡组名称：' name || return 2
+  safe_name "$name" || { fail '均衡组名称无效。'; return 1; }
+  list_network_items outbounds >&2
+  read -r -p '成员出站标签（英文逗号分隔）：' input || return 2
+  members="$(csv_json "$input")" || return 1
+  ui_item 1 '随机（random）'
+  ui_item 2 '轮询（roundRobin）'
+  ui_item 3 '最低延迟（leastPing，启用健康探测）'
+  read -r -p '选择策略 [1-3，默认 2]：' input || return 2
+  case "$input" in 1) strategy=random ;; 2|'') strategy=roundRobin ;; 3) strategy=leastPing ;; *) return 2 ;; esac
+  read -r -p '全部成员不可用时的回退出站标签（回车不配置）：' fallback || return 2
+  if [[ -z "${1:-}" ]]; then network_add_balancer "$name" "$members" "$strategy" "$fallback" "$tag"
+  else
+    tmp="$(network_candidate)" || return 1
+    jq --arg t "$tag" --arg n "$name" --argjson m "$members" --arg s "$strategy" --arg f "$fallback" '
+      (.balancers[]|select(.tag==$t)) |= (.name=$n|.members=$m|
+        .config=({tag:$t,selector:$m,strategy:{type:$s}}+(if $f!="" then {fallbackTag:$f} else {} end)))' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    apply_network_state "$tmp"
+  fi
+}
+
+set_balancer_probe() {
+  local url interval tmp
+  read -r -p '健康探测 URL（回车使用 https://www.gstatic.com/generate_204）：' url || return 2
+  url="${url:-https://www.gstatic.com/generate_204}"
+  [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || { fail '探测地址无效。'; return 1; }
+  read -r -p '探测间隔（如 30s、1m，默认 30s）：' interval || return 2
+  interval="${interval:-30s}"
+  [[ "$interval" =~ ^[1-9][0-9]*(s|m|h)$ ]] || { fail '间隔需为正整数加 s、m 或 h。'; return 1; }
+  tmp="$(network_candidate)" || return 1
+  jq --arg u "$url" --arg i "$interval" '.probe={url:$u,interval:$i} |
+    if .observatory!=null then .observatory.probeURL=$u|.observatory.probeInterval=$i else . end' "$NETWORK_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  apply_network_state "$tmp"
+}
+
+manage_balancer() {
+  local tag="$1" answer item member value
+  while item="$(get_network_item balancers "$tag")"; do
+    ui_title "负载均衡：$(jq -r '.name' <<< "$item")"
+    jq '{tag,enabled,members,strategy:.config.strategy,fallback:.config.fallbackTag}' <<< "$item"
+    ui_item 1 '修改成员 / 策略 / 回退出站'
+    ui_item 2 '逐个测试成员连接'
+    ui_item 3 '启用 / 停用'
+    ui_item 4 '修改名称'
+    ui_item 5 '导出均衡组 JSON'
+    ui_item 6 '删除均衡组'
+    ui_back
+    read -r -p '请选择 [1-6 / 0]：' answer || return 0
+    case "$answer" in
+      1) balancer_wizard "$tag" || true ;;
+      2) while IFS= read -r member; do probe_outbound "$member" || true; done < <(jq -r '.members[]' <<< "$item") ;;
+      3) network_update balancers "$tag" toggle || true ;;
+      4) read -r -p '新的名称：' value && network_update balancers "$tag" rename "$value" || true ;;
+      5) jq '.config' <<< "$item" ;;
+      6) if network_update balancers "$tag" delete; then return 0; fi ;;
+      0|'') return 0 ;;
+      *) warn '请输入菜单中的序号。' ;;
+    esac
+  done
+}
+
+balancer_menu() {
+  local answer tag
+  while :; do
+    ui_title '负载均衡'
+    list_network_items balancers
+    ui_item 1 '创建均衡组（随机 / 轮询 / 最低延迟）'
+    ui_item 2 '管理均衡组（成员 / 策略 / 回退 / 开关 / 测试）'
+    ui_item 3 '设置健康探测 URL 和间隔'
+    ui_back
+    read -r -p '请选择 [1-3 / 0]：' answer || return 0
+    case "$answer" in
+      1) balancer_wizard || true ;;
+      2) if tag="$(choose_network_item balancers)"; then manage_balancer "$tag"; fi ;;
+      3) set_balancer_probe || true ;;
+      0|'') return 0 ;;
+      *) warn '请输入菜单中的序号。' ;;
+    esac
+  done
+}
+
 next_node_name() {
   local n=1
   while resolve_node_tag "入站$n" >/dev/null 2>&1; do ((n+=1)); done
@@ -1461,8 +2224,50 @@ random_reality_servers() {
   printf '%s\n' "${servers[@]}"
 }
 
+choose_custom_connection_setup() {
+  local answer host port public_port='' nat=false dynamic=false
+  ui_title '连接设置' >&2
+  read -r -p '需要手动设置监听端口吗？[y/N，回车自动选择空闲端口，0 返回]：' answer || return 1
+  case "$answer" in
+    y|Y|yes|YES|是) port="$(choose_port)" || return 1 ;;
+    ''|n|N|no|NO|否) port="$(choose_port auto)" || return 1 ;;
+    0) return 1 ;;
+    *) fail '请选择 y 或 n，或输入 0 返回。'; return 1 ;;
+  esac
+  info "本机监听端口：$port" >&2
+  read -r -p '公网连接端口是否与监听端口不同？[y/N，0 返回]：' answer || return 1
+  case "$answer" in
+    y|Y|yes|YES|是)
+      while :; do
+        read -r -p '公网连接端口（已分配或已配置映射的端口，0 返回）：' answer || return 1
+        [[ "$answer" != 0 ]] || return 1
+        if public_port="$(normalize_port "$answer")"; then break; fi
+        warn '请输入 1～65535 之间的端口号，或输入 0 返回。'
+      done
+      nat=true
+      ;;
+    ''|n|N|no|NO|否) ;;
+    0) return 1 ;;
+    *) fail '请选择 y 或 n，或输入 0 返回。'; return 1 ;;
+  esac
+  host="$(choose_node_host false)" || return 1
+  if valid_domain "$host"; then
+    read -r -p '需要设置此域名的 DDNS 更新方式吗？[y/N，0 返回]：' answer || return 1
+    case "$answer" in
+      y|Y|yes|YES|是) host="$(choose_dynamic_host "$host")" || return 1; dynamic=true ;;
+      ''|n|N|no|NO|否) ;;
+      0) return 1 ;;
+      *) fail '请选择 y 或 n，或输入 0 返回。'; return 1 ;;
+    esac
+  fi
+  jq -n --arg host "$host" --argjson port "$port" --argjson nat "$nat" --argjson dynamic "$dynamic" \
+    --arg public_port "$public_port" '{host:$host,port:$port,nat:$nat,dynamic:$dynamic} +
+    (if $nat then {public_port:($public_port|tonumber)} else {} end)'
+}
+
 choose_connection_setup() {
   local style="${1:-auto}" current_port="${2:-}" choice host port public_port='' nat=false dynamic=false input
+  if [[ "$style" == custom ]]; then choose_custom_connection_setup; return $?; fi
   ui_title '服务器的网络环境' >&2
   ui_item 1 '独立公网 / 固定 IP（普通 VPS，默认）' >&2
   ui_item 2 'NAT / 端口映射（服务商分配端口、家用路由器）' >&2
@@ -1497,8 +2302,6 @@ choose_connection_setup() {
     say "本机监听端口使用 $port；如需映射到其他本机端口，可在创建后通过 入站管理 → 修改本机监听端口 调整。" >&2
   elif [[ -n "$current_port" ]]; then
     port="$current_port"
-  elif [[ "$style" == custom ]]; then
-    port="$(choose_port)" || return 1
   else
     port="$(choose_port auto)" || return 1
   fi
@@ -1829,7 +2632,8 @@ delete_node() {
   read -r -p "将删除入站 $(visible_node_name "$tag") 及其全部客户端，输入 '确认删除' 继续：" yes || return 2
   [[ "$yes" == "确认删除" ]] || { info '已取消删除。'; return 2; }
   tmp="$(mktemp "$ETC_DIR/.config.XXXXXX.json")"
-  if jq -e --arg t "$tag" 'any(.routing.rules[]?; any(.inboundTag[]?; .==$t))' "$CONFIG" >/dev/null; then
+  if jq -e --arg t "$tag" 'any(.routing.rules[]?; any(.inboundTag[]?; .==$t))' "$CONFIG" >/dev/null ||
+     { [[ -f "$NETWORK_FILE" ]] && jq -e --arg t "$tag" 'any(.rules[]?; any(.config.inboundTag[]?; .==$t))' "$NETWORK_FILE" >/dev/null; }; then
     rm -f "$tmp"; fail '已有路由规则引用此入站，请先移除对应规则再删除。'; return 1
   fi
   jq --arg t "$tag" '.inbounds |= map(select(.tag!=$t))' "$INBOUNDS_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -3025,22 +3829,29 @@ menu() {
     ui_text '1;32' '  1）快速创建节点（自动创建入站 + 客户端）'
     ui_item 2 '查看节点 / 复制链接（入站 → 客户端）'
     ui_item 3 '入站与客户端总览（不显示密码）'
-    ui_section '管理与维护'
+    ui_section '配置管理'
     ui_item 4 '入站与客户端管理'
-    ui_item 5 '服务管理（状态 / 重启 / 日志）'
-    ui_item 6 '高级设置（自定义创建 / 内核 / DDNS / 卸载）'
+    ui_item 5 '服务器出站（导入链接 / JSON）'
+    ui_item 6 '路由规则（分流 / 默认出口）'
+    ui_item 7 '负载均衡（策略 / 健康探测 / 回退）'
+    ui_section '维护'
+    ui_item 8 '服务管理（状态 / 重启 / 日志）'
+    ui_item 9 '高级设置（自定义创建 / 内核 / DDNS / 卸载）'
     ui_back '退出管理系统'
     say '  连接节点 = 入站的地址和端口 + 客户端凭据；一个入站可管理多个客户端。'
     say '  NAT 请先查看服务商/路由器分配的端口；动态 IP 请选择 DDNS。'
     say ''
-    read -r -p '请选择 [1-6 / 0]：' ans || return 0
+    read -r -p '请选择 [1-9 / 0]：' ans || return 0
     case "$ans" in
       1) quick_add_node || true ;;
       2) links_menu || true ;;
       3) list_inbounds_tree || true ;;
       4) node_menu || true ;;
-      5) service_menu ;;
-      6)
+      5) outbound_menu ;;
+      6) routing_menu ;;
+      7) balancer_menu ;;
+      8) service_menu ;;
+      9)
         if advanced_menu; then :
         else
           result=$?
@@ -3049,7 +3860,7 @@ menu() {
         ;;
       0) return 0 ;;
       '') continue ;;
-      *) warn '请输入 1～6，或输入 0 退出。' ;;
+      *) warn '请输入 1～9，或输入 0 退出。' ;;
     esac
   done
 }
@@ -3066,6 +3877,11 @@ Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality / SOCKS5 / HTTP）
       sudo xnode show          # 按入站 → 客户端查看链接或出站 JSON
       sudo xnode inbounds      # 管理入站和客户端
       sudo xnode clients       # 选择入站，管理其中的客户端
+      sudo xnode outbounds     # 出站设置：链接 / JSON 导入、测试和管理
+      sudo xnode routing       # 路由规则和默认出口
+      sudo xnode balancers     # 负载均衡和健康探测
+      sudo xnode outbound-import FILE  # 从文件导入出站（- 表示标准输入）
+      sudo xnode rule-import FILE      # 从文件导入规则
       sudo xnode status        # 查看服务状态
       sudo xnode logs          # 查看运行日志
       sudo xnode logs on       # 开启警告 / 错误日志（默认关闭）
@@ -3131,6 +3947,11 @@ main() {
     list) list_nodes ;;
     inbounds) node_menu ;;
     clients) local tag; tag="$(choose_node auto)" && clients_menu "$tag" ;;
+    outbounds) outbound_menu ;;
+    routing) routing_menu ;;
+    balancers) balancer_menu ;;
+    outbound-import) local parsed; parsed="$(cat -- "${2:--}" | parse_outbound_input)" && network_add_outbounds "$parsed" ;;
+    rule-import) local input; input="$(cat -- "${2:--}")" && import_rules "$input" ;;
     status) status ;;
     logs) logs "${2:-show}" ;;
     ddns) ddns_menu ;;

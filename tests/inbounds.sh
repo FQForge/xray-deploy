@@ -117,9 +117,9 @@ service_restart() { touch "$test_root/active"; }
 pass 'config validation failure and service restart failure roll back both files'
 
 # Exercise the actual prompt order, including advanced creation with a saved empty inbound.
-add_node <<< $'4\n自定义代理\n1\n35001\ny\nnodes.example.com\n中文客户端\nmanual@user\nmanual:pass@%\n' > "$test_root/output" 2>&1
+add_node <<< $'4\n自定义代理\ny\n35001\nn\ny\nnodes.example.com\nn\n中文客户端\nmanual@user\nmanual:pass@%\n' > "$test_root/output" 2>&1
 check '.inbounds[]|select(.tag=="socks5-自定义代理")|.clients[0].name=="中文客户端" and .clients[0].account.user=="manual@user"'
-advanced_menu <<< $'1\n1\n稍后添加\n2\n1\n35002\ny\nnodes.example.com\n0\n0\n' > "$test_root/output" 2>&1
+advanced_menu <<< $'1\n1\n稍后添加\n2\ny\n35002\nn\ny\nnodes.example.com\nn\n0\n0\n' > "$test_root/output" 2>&1
 check '.inbounds[]|select(.tag=="ss-稍后添加")|.clients==[]'
 check 'all(.inbounds[];.tag!="ss-稍后添加")' "$CONFIG"
 for protocol_choice in 1 2 3 4 5; do
@@ -131,6 +131,25 @@ list_inbounds_tree > "$test_root/overview"
 links_menu <<< $'1\nsocks5-自定义代理\n1\n0\n0\n' > "$test_root/output" 2>&1
 grep -Fq 'manual:pass@%' "$test_root/output"
 pass 'custom prompt order, advanced save without client, five quick protocols and nested viewing'
+
+# Optional connection settings are independent; DDNS provider calls stay isolated.
+(
+  detect_public_host() { printf '2001:db8::10\n'; }
+  endpoint="$(choose_connection_setup custom <<< $'n\nn\nn\n' 2> "$test_root/prompts")"
+  check '.host=="2001:db8::10" and .port>=10000 and .port<=60000 and .nat==false and .dynamic==false' <(printf '%s\n' "$endpoint")
+  ! grep -Fq '请选择网络环境' "$test_root/prompts"
+  ! grep -Fq 'DDNS 更新方式' "$test_root/prompts"
+  configure_ddns() { jq -n --arg provider "$1" --arg host "$2" '{provider:$provider,host:$host}' > "$DDNS_FILE"; }
+  endpoint="$(choose_connection_setup custom <<< $'y\n35003\ny\ninvalid\n443\ny\nnodes.example.com\ny\n2\n' 2> "$test_root/prompts")"
+  check '.host=="nodes.example.com" and .port==35003 and .public_port==443 and .nat==true and .dynamic==true' <(printf '%s\n' "$endpoint")
+  check '.provider=="cloudflare" and .host=="nodes.example.com"' "$DDNS_FILE"
+  endpoint="$(choose_connection_setup custom <<< $'y\n35004\nn\ny\nnodes.example.com\ny\n1\n' 2> "$test_root/prompts")"
+  check '.dynamic==true and .nat==false' <(printf '%s\n' "$endpoint")
+  ! choose_connection_setup custom <<< '0' > "$test_root/output" 2>&1
+  ! choose_connection_setup custom <<< $'y\n35005\n0\n' > "$test_root/output" 2>&1
+  ! choose_connection_setup custom <<< $'y\n35005\nn\ny\nnodes.example.com\n0\n' > "$test_root/output" 2>&1
+)
+pass 'custom optional ports, public mapping, automatic IPv6, optional DDNS and cancellation without a network-type menu'
 
 choose_port() { printf '31000\n'; }
 change_port ss-empty > "$test_root/output" 2>&1
