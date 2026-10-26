@@ -86,6 +86,20 @@ ui_section() { say ''; ui_text '1;36' "  $1"; }
 ui_item() { printf '  %s）%s\n' "$1" "$2"; }
 ui_back() { say ''; ui_item 0 "${1:-返回上级菜单}"; say ''; }
 
+# column 在 C/POSIX 环境会将中文转义成 \xNN；仅在可用的 UTF-8 环境中对齐。
+# 精简系统没有 locale 或 UTF-8 环境时，直接保留原始制表符和中文。
+ui_table() {
+  local table_locale=''
+  if command -v column >/dev/null 2>&1 && command -v locale >/dev/null 2>&1; then
+    table_locale="$(locale -a 2>/dev/null | awk 'tolower($0) ~ /utf-?8($|@)/ && !found {print; found=1}')" || table_locale=''
+  fi
+  if [[ -n "$table_locale" ]]; then
+    LC_ALL="$table_locale" column -t -s $'\t'
+  else
+    cat
+  fi
+}
+
 detect_distribution() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -1187,7 +1201,7 @@ list_clients() {
     (if .value.enabled then "启用" else "停用" end)] | @tsv' <<< "$record")" || return 1
   [[ -n "$rows" ]] || { say '暂无客户端；添加首个客户端后才会监听入站端口。'; return 0; }
   printf '序号\t客户端名称\t状态\n%s\n' "$rows" |
-    { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
+    ui_table
 }
 
 choose_client() {
@@ -1721,7 +1735,7 @@ list_nodes() {
      (($active|length|tostring)+"/"+(.clients|length|tostring))] | @tsv' "$INBOUNDS_FILE")" || return 1
   [[ -n "$rows" ]] || { say '当前没有入站。主菜单 1 可快速创建，高级设置 1 可自定义创建。'; return 0; }
   printf '序号\t入站名称\t状态\t协议/加密\t本机端口\t公网端口\t客户端(启用/总数)\n%s\n' "$rows" |
-    { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
+    ui_table
   say '状态为配置开关；服务是否运行请查看服务状态。'
 }
 
