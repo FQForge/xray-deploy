@@ -204,19 +204,38 @@ try:
         command('network_add_rule source \'{"inboundTag":["socks5-routing"],"outboundTag":"B"}\' source')
         request('B'); command('network_update rules source delete')
         print('PASS actual domain/IP/port/inbound rules, blocking, rule ordering, switches and direct default',flush=True)
-        # Per-client routing uses the stable SS account email.
+        # Use displayed menu indices, with no balancer and one client, as in the reported bug.
+        state=json.loads((root/'etc/inbounds.json').read_text())
+        source_index=next(index+1 for index,item in enumerate(state['inbounds']) if item['tag']=='ss-identity')
+        network=json.loads((root/'etc/network.json').read_text())
+        outbound_index=next(index+1 for index,item in enumerate(network['outbounds']) if item['tag']=='A')
+        dialog=['唯一客户端向导',str(source_index),'y','','','','','3',str(outbound_index)]
+        command('rule_wizard <<< '+quote('\n'.join(dialog)+'\n'))
+        network=json.loads((root/'etc/network.json').read_text())
+        rule_key=next(item['key'] for item in network['rules'] if item['name']=='唯一客户端向导')
+        assert network['balancers']==[]
+        single=next(item for item in state['inbounds'] if item['tag']=='ss-identity')['clients'][0]
+        out=json.loads(command('make_node_outbound_json ss-identity '+quote(single['key'])))
+        client_port=free_port()
+        start('single-ui',{'log':{'loglevel':'none'},'inbounds':[inbound('socks',client_port,{'auth':'noauth'})|{'listen':'127.0.0.1'}],'outbounds':[out]})
+        wait_port(client_port);request('A',username='',password='',proxy_port=client_port);stop('single-ui')
+        command('network_update rules '+quote(rule_key)+' delete')
+        print('PASS real wizard with inbound/outbound indices, one client, and no balancer routes through the selected outbound',flush=True)
+        # The multi-client wizard also stores the stable SS account email.
         command('add_client ss-identity auto')
         state=json.loads((root/'etc/inbounds.json').read_text()); record=next(i for i in state['inbounds'] if i['tag']=='ss-identity')
-        user=record['clients'][0]
-        command('network_add_rule user '+quote(json.dumps({'user':[user['account']['email']],'outboundTag':'A'}))+' client')
+        dialog=['多客户端向导',str(source_index),'y','1','','','','','3',str(outbound_index)]
+        command('rule_wizard <<< '+quote('\n'.join(dialog)+'\n'))
+        network=json.loads((root/'etc/network.json').read_text())
+        rule_key=next(item['key'] for item in network['rules'] if item['name']=='多客户端向导')
         for index, client in enumerate(record['clients']):
             out=json.loads(command('make_node_outbound_json ss-identity '+quote(client['key'])))
             localport=0
             with socket.socket() as s: s.bind(('127.0.0.1',0));localport=s.getsockname()[1]
             start('client',{'log':{'loglevel':'none'},'inbounds':[inbound('socks',localport,{'auth':'noauth'})|{'listen':'127.0.0.1'}], 'outbounds':[out]})
             wait_port(localport);request('A' if index==0 else 'D',username='',password='',proxy_port=localport);stop('client')
-        command('network_update rules client delete')
-        print('PASS two SS clients independently routed by stable identity',flush=True)
+        command('network_update rules '+quote(rule_key)+' delete')
+        print('PASS multi-client wizard routes two SS clients independently by stable identity',flush=True)
         command('network_add_balancer round \'["A","B"]\' roundRobin \'\' round\nnetwork_add_balancer random \'["A","B"]\' random \'\' random\nnetwork_add_balancer latency \'["A","B"]\' leastPing direct latency')
         default('round',True)
         results=[request().stdout for _ in range(8)]

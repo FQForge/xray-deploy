@@ -93,6 +93,8 @@ SS2022 AES 多客户端的分享密码必须是 `服务端密钥:客户端密钥
 
 规则向导提供来源入站、可识别的客户端 email、目标域名/IP/端口/网络和去向。原生 JSON 可设置更多内核支持的条件。检查涵盖缺失引用、停用目标、重复规则和前置全匹配规则；最终始终调用内核校验。GeoIP/GeoSite 数据库由用户准备，未安装时内核校验会拒绝相应规则。
 
+选择方式参考 [3x-ui v3.11.0](https://github.com/MHSanaei/3x-ui/releases/tag/v3.11.0) 的规则与均衡表单：显示名称与实际标签分开，入站允许多选，出站与均衡组分别选择。终端中的序号、标签或名称先解析成实际标签再保存；客户端选择保存稳定 email。未设置均衡组也可独立指定出站。无效或停用的选择在当前步骤重选，引用校验显示具体规则、入站、出站或均衡组名称。
+
 均衡策略为 random、roundRobin、leastPing。Xray 的 selector 使用标签前缀，因此编译前检查实际匹配集合必须等于用户选择的成员集合。最低延迟和 fallback 会为成员自动生成健康探测，普通随机和轮询组可不启用探测。现有观测配置保留并补齐所需成员；健康探测使用内核后台任务，无额外常驻管理进程。
 
 启用规则、默认出口和均衡组成员必须引用启用的目标。删除操作检查全部规则（包括停用规则）、均衡组和出站链依赖，避免稍后启用配置时引用失效。直连出站受保护。修改先生成候选配置并备份，通过校验及服务重启后提交管理数据；失败时恢复配置和原服务状态。
@@ -105,6 +107,7 @@ SS2022 AES 多客户端的分享密码必须是 `服务端密钥:客户端密钥
 XRAY_TEST_CORE=/usr/local/bin/xray-ss-core bash tests/inbounds.sh
 XRAY_TEST_CORE=/usr/local/bin/xray-ss-core bash tests/integration.sh
 XRAY_TEST_CORE=/usr/local/bin/xray-ss-core bash tests/network.sh
+XRAY_TEST_CORE=/usr/local/bin/xray-ss-core bash tests/routing-ui.sh
 XRAY_TEST_CORE=/usr/local/bin/xray-ss-core python3 tests/network-integration.py
 ```
 

@@ -1513,29 +1513,39 @@ validate_network_shape() {
 }
 
 validate_network_state() {
-  local state="$1" known
+  local state="$1" known issues issue
   validate_network_shape "$state" || { fail '网络配置结构、标签或规则目标无效。'; return 1; }
   known="$(jq -s '[.[].inbounds[].tag]|unique' "$INBOUNDS_FILE" "$CONFIG")" || return 1
-  jq -e --argjson known "$known" '
-    . as $s | [.outbounds[]|select(.enabled)|.tag] as $outs |
+  issues="$(jq -r --argjson known "$known" '
+    [.outbounds[]|select(.enabled)|.tag] as $outs |
     [.balancers[]|select(.enabled)|.tag] as $groups |
-    def target_ok:
-      if has("outboundTag") then .outboundTag as $t | ($outs|index($t))!=null
-      else .balancerTag as $t | ($groups|index($t))!=null end;
-    (.default|target_ok) and
-    any(.outbounds[]; .tag=="direct" and .enabled and .config.protocol=="freedom") and
-    all(.outbounds[]|select(.enabled);
-      [(.config.proxySettings.tag // empty),(.config.streamSettings.sockopt.dialerProxy // empty)] |
-      all(.[]; . as $t|($outs|index($t))!=null)) and
-    all(.rules[]|select(.enabled);
-      (.config|target_ok) and all(.config.inboundTag[]?; . as $t|($known|index($t))!=null)) and
-    all(.balancers[]|select(.enabled);
-      . as $b | all(.members[]; . as $t|($outs|index($t))!=null) and
-      ((.config.fallbackTag // "") as $f | $f=="" or ($outs|index($f))!=null) and
-      ([$outs[] | . as $t | select(any($b.members[]; . as $p | $t|startswith($p)))]|sort)==(.members|unique|sort))
-  ' "$state" >/dev/null || {
-    fail '存在无效引用：默认出口、启用规则和均衡组必须引用启用的目标；均衡成员标签不能额外匹配其他出口。'; return 1;
-  }
+    def target_issue($name):
+      if has("outboundTag") then .outboundTag as $t |
+        if ($outs|index($t))==null then $name+"引用的出站「"+$t+"」不存在或已停用。" else empty end
+      else .balancerTag as $t |
+        if ($groups|index($t))==null then $name+"引用的均衡组「"+$t+"」不存在或已停用。" else empty end end;
+    [(.default|target_issue("默认出口")),
+     (if any(.outbounds[]; .tag=="direct" and .enabled and .config.protocol=="freedom") then empty
+      else "需保留启用的 direct 直连出站（freedom）。" end),
+     (.outbounds[]|select(.enabled)|. as $o|
+      [(.config.proxySettings.tag // empty),(.config.streamSettings.sockopt.dialerProxy // empty)][] as $t|
+      if ($outs|index($t))==null then "出站「"+$o.name+"」引用的链式出站「"+$t+"」不存在或已停用。" else empty end),
+     (.rules[]|select(.enabled)|. as $r|
+      (.config|target_issue("规则「"+$r.name+"」")),
+      (.config.inboundTag[]? as $t|if ($known|index($t))==null
+        then "规则「"+$r.name+"」引用的来源入站「"+$t+"」不存在。" else empty end)),
+     (.balancers[]|select(.enabled)|. as $b|
+      (.members[] as $t|if ($outs|index($t))==null
+        then "均衡组「"+$b.name+"」的成员「"+$t+"」不存在或已停用。" else empty end),
+      ((.config.fallbackTag // "") as $f|if $f!="" and ($outs|index($f))==null
+        then "均衡组「"+$b.name+"」的回退出站「"+$f+"」不存在或已停用。" else empty end),
+      ([$outs[]|. as $t|select(any($b.members[];. as $p|$t|startswith($p)))] - .members |
+        if length>0 then "均衡组「"+$b.name+"」的成员前缀额外匹配了出站："+join(", ")+"。请使用不重叠的出站标签。" else empty end))] | unique[]
+  ' "$state")" || { fail '无法检查网络引用，请检查原生 JSON 中的字段类型。'; return 1; }
+  if [[ -n "$issues" ]]; then
+    while IFS= read -r issue; do warn "$issue"; done <<< "$issues"
+    return 1
+  fi
 }
 
 render_network_config() {
@@ -1687,20 +1697,20 @@ list_network_items() {
 }
 
 choose_network_item() {
-  local kind="$1" input key record
+  local kind="$1" mode="${2:-all}" input selected
   list_network_items "$kind" >&2 || return 1
-  jq -e --arg kind "$kind" '.[$kind]|length>0' "$NETWORK_FILE" >/dev/null || return 2
+  if ! jq -e --arg kind "$kind" --arg mode "$mode" 'any(.[$kind][]; $mode!="enabled" or .enabled)' "$NETWORK_FILE" >/dev/null; then
+    warn '没有可选择的对象，请先创建并启用。'; return 2
+  fi
   while :; do
     read -r -p '输入序号、标签或名称（0 / 回车返回）：' input || return 2
     [[ -n "$input" && "$input" != 0 ]] || return 2
-    record="$(jq -c --arg kind "$kind" --arg input "$input" '[.[$kind]|to_entries[]|
-      select((.key+1|tostring)==$input or .value.tag==$input or .value.key==$input or .value.name==$input)|.value]|
-      if length==1 then .[0] else empty end' "$NETWORK_FILE")" || return 1
-    if [[ -n "$record" ]]; then
-      key="$(jq -r --arg kind "$kind" 'if $kind=="rules" then .key else .tag end' <<< "$record")"
-      printf '%s\n' "$key"; return 0
+    if selected="$(resolve_network_selection "$kind" "$input" "$mode")"; then
+      if [[ "$(jq 'length' <<< "$selected")" == 1 ]]; then
+        jq -r '.[0]' <<< "$selected"; return 0
+      fi
+      warn '此处请选择一个对象。'
     fi
-    warn '未找到唯一对象，请使用列表中的序号或标签。'
   done
 }
 
@@ -1722,15 +1732,65 @@ csv_json() {
   jq -cn --arg value "$1" '$value|split(",")|map(gsub("^\\s+|\\s+$";""))|map(select(length>0))|unique'
 }
 
+resolve_network_selection() {
+  local kind="$1" input="$2" mode="${3:-all}" values value record selected='[]'
+  values="$(csv_json "$input")" || return 1
+  [[ "$(jq 'length' <<< "$values")" != 0 ]] || { fail '请至少选择一个对象。'; return 1; }
+  while IFS= read -r value; do
+    record="$(jq -ec --arg kind "$kind" --arg value "$value" '
+      .[$kind] as $items |
+      ([$items|to_entries[]|select((.key+1|tostring)==$value)|.value]) as $by_index |
+      ([$items[]|select((if $kind=="rules" then .key else .tag end)==$value)]) as $by_tag |
+      (if ($by_index|length)>0 then $by_index elif ($by_tag|length)>0 then $by_tag
+       else [$items[]|select(.name==$value)] end) |
+      if length==1 then .[0] else empty end' "$NETWORK_FILE")" || {
+      fail "未找到唯一对象：$value。请输入列表中的序号、标签或名称。"; return 1;
+    }
+    if [[ "$mode" == enabled ]] && ! jq -e '.enabled' <<< "$record" >/dev/null; then
+      fail "$(jq -r '.name' <<< "$record") 已停用，请先启用或选择其他对象。"; return 1
+    fi
+    selected="$(jq --argjson record "$record" --arg kind "$kind" '.+[(if $kind=="rules" then $record.key else $record.tag end)]|unique' <<< "$selected")" || return 1
+  done < <(jq -r '.[]' <<< "$values")
+  printf '%s\n' "$selected"
+}
+
+choose_rule_sources() {
+  local input values value tag selected index count
+  list_nodes >&2 || return 1
+  count="$(jq '.inbounds|length' "$INBOUNDS_FILE")" || return 1
+  while :; do
+    read -r -p '来源入站序号、标签或名称（多个用英文逗号分隔，回车表示所有入站，0 返回）：' input || return 2
+    [[ "$input" != 0 ]] || return 2
+    values="$(csv_json "$input")" || return 1
+    selected='[]'
+    while IFS= read -r value; do
+      tag=''
+      if [[ "$value" =~ ^[0-9]{1,6}$ ]]; then
+        index=$((10#$value))
+        if ((index>=1 && index<=count)); then tag="$(jq -r --argjson i "$((index-1))" '.inbounds[$i].tag' "$INBOUNDS_FILE")" || return 1; fi
+      fi
+      if [[ -z "$tag" ]] && ! tag="$(resolve_node_tag "$value" 2>/dev/null)"; then
+        warn "未找到来源入站：$value。请重新选择列表中的序号、标签或名称。"
+        selected=''; break
+      fi
+      selected="$(jq --arg tag "$tag" '.+[$tag]|unique' <<< "$selected")" || return 1
+    done < <(jq -r '.[]' <<< "$values")
+    [[ -n "$selected" ]] || continue
+    if [[ "$selected" != '[]' ]]; then info "已选择来源入站：$(jq -r 'join(", ")' <<< "$selected")" >&2; fi
+    printf '%s\n' "$selected"; return 0
+  done
+}
+
 choose_route_target() {
   local answer tag
-  ui_item 1 '直连' >&2
-  ui_item 2 '拦截' >&2
-  ui_item 3 '指定出站' >&2
-  ui_item 4 '负载均衡组' >&2
-  ui_item 0 '返回' >&2
-  read -r -p '请选择流量去向 [1-4 / 0]：' answer || return 2
-  case "$answer" in
+  while :; do
+    ui_item 1 '直连' >&2
+    ui_item 2 '拦截' >&2
+    ui_item 3 '指定出站（不使用负载均衡）' >&2
+    ui_item 4 '负载均衡组' >&2
+    ui_item 0 '返回' >&2
+    read -r -p '请选择流量去向 [1-4 / 0]：' answer || return 2
+    case "$answer" in
     1) printf '%s\n' '{"outboundTag":"direct"}' ;;
     2)
       if ! jq -e 'any(.outbounds[];.tag=="blocked" and .enabled and .config.protocol=="blackhole")' "$NETWORK_FILE" >/dev/null; then
@@ -1740,10 +1800,17 @@ choose_route_target() {
         network_add_outbounds '[{"name":"拦截","config":{"tag":"blocked","protocol":"blackhole","settings":{}}}]' >&2 || return 1
       fi
       printf '%s\n' '{"outboundTag":"blocked"}' ;;
-    3) tag="$(choose_network_item outbounds)" || return $?; jq -cn --arg tag "$tag" '{outboundTag:$tag}' ;;
-    4) tag="$(choose_network_item balancers)" || return $?; jq -cn --arg tag "$tag" '{balancerTag:$tag}' ;;
-    *) return 2 ;;
-  esac
+    3) if ! tag="$(choose_network_item outbounds enabled)"; then continue; fi; jq -cn --arg tag "$tag" '{outboundTag:$tag}' ;;
+    4)
+      if ! jq -e 'any(.balancers[];.enabled)' "$NETWORK_FILE" >/dev/null; then
+        warn '当前没有启用的均衡组。可以选择“3 · 指定出站”，也可在主菜单 7 创建均衡组。'; continue
+      fi
+      if ! tag="$(choose_network_item balancers enabled)"; then continue; fi; jq -cn --arg tag "$tag" '{balancerTag:$tag}' ;;
+    0) return 2 ;;
+    *) warn '请输入 1～4，或输入 0 返回。'; continue ;;
+    esac
+    return 0
+  done
 }
 
 import_outbounds_menu() {
@@ -1852,15 +1919,18 @@ rule_wizard() {
   local existing="${1:-}" name input sources domains ips ports network target rule client='' email='' key tmp
   read -r -p '规则名称：' name || return 2
   safe_name "$name" || { fail '规则名称无效。'; return 1; }
-  list_nodes >&2
-  read -r -p '来源入站标签（多个用英文逗号分隔，回车表示所有入站）：' input || return 2
-  sources="$(csv_json "$input")" || return 1
+  sources="$(choose_rule_sources)" || return $?
   read -r -p '是否进一步限定客户端？[y/N]：' input || return 2
   if [[ "$input" == y || "$input" == Y ]]; then
-    [[ "$(jq 'length' <<< "$sources")" == 1 ]] || { fail '限定客户端时请选择一个来源入站。'; return 1; }
+    while [[ "$(jq 'length' <<< "$sources")" != 1 ]]; do
+      warn '限定客户端时请选择一个来源入站。'
+      sources="$(choose_rule_sources)" || return $?
+    done
     input="$(jq -r '.[0]' <<< "$sources")"
+    get_inbound "$input" >/dev/null || { fail '此入站没有可管理的客户端，请使用整个入站分流。'; return 1; }
     client="$(choose_client "$input" auto)" || return $?
     email="$(get_client "$input" "$client" | jq -er '.account.email // empty')" || { fail '此协议没有可用于路由识别的客户端身份，请按入站分流。'; return 1; }
+    info "已限定客户端：$(get_client "$input" "$client" | jq -r '.name')"
   fi
   read -r -p '目标域名（逗号分隔，支持 domain:/full:/regexp:/keyword:/geosite:，回车不限）：' input || return 2
   domains="$(csv_json "$input" | jq 'map(if startswith("keyword:") then .[8:] elif contains(":") then . else "domain:"+. end)')" || return 1
@@ -2028,14 +2098,25 @@ balancer_wizard() {
   read -r -p '均衡组名称：' name || return 2
   safe_name "$name" || { fail '均衡组名称无效。'; return 1; }
   list_network_items outbounds >&2
-  read -r -p '成员出站标签（英文逗号分隔）：' input || return 2
-  members="$(csv_json "$input")" || return 1
+  while :; do
+    read -r -p '成员出站序号、标签或名称（英文逗号分隔，0 返回）：' input || return 2
+    [[ "$input" != 0 ]] || return 2
+    if members="$(resolve_network_selection outbounds "$input" enabled)"; then break; fi
+  done
   ui_item 1 '随机（random）'
   ui_item 2 '轮询（roundRobin）'
   ui_item 3 '最低延迟（leastPing，启用健康探测）'
   read -r -p '选择策略 [1-3，默认 2]：' input || return 2
   case "$input" in 1) strategy=random ;; 2|'') strategy=roundRobin ;; 3) strategy=leastPing ;; *) return 2 ;; esac
-  read -r -p '全部成员不可用时的回退出站标签（回车不配置）：' fallback || return 2
+  while :; do
+    read -r -p '全部成员不可用时的回退出站序号、标签或名称（回车不配置，0 返回）：' input || return 2
+    [[ "$input" != 0 ]] || return 2
+    [[ -n "$input" ]] || break
+    if input="$(resolve_network_selection outbounds "$input" enabled)"; then
+      if [[ "$(jq 'length' <<< "$input")" == 1 ]]; then fallback="$(jq -r '.[0]' <<< "$input")"; break; fi
+      warn '回退请选择一个出站。'
+    fi
+  done
   if [[ -z "${1:-}" ]]; then network_add_balancer "$name" "$members" "$strategy" "$fallback" "$tag"
   else
     tmp="$(network_candidate)" || return 1
