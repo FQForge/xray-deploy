@@ -1834,7 +1834,7 @@ import_outbounds_menu() {
 }
 
 probe_outbound() (
-  local tag="$1" url="${2:-https://www.bing.com/}" record tmp pid='' port result
+  local tag="$1" url="${2:-https://www.bing.com/}" record tmp pid='' port result http_code total_time latency_ms
   record="$(get_network_item outbounds "$tag")" || return 1
   [[ "$url" =~ ^https?://[^[:space:]]+$ ]] || { fail '探测地址需为有效 HTTP / HTTPS URL。'; return 1; }
   tmp="$(mktemp -d "$ETC_DIR/.outbound-probe.XXXXXX")" || return 1
@@ -1851,8 +1851,11 @@ probe_outbound() (
   "$CORE_LINK" run -config "$tmp/client.json" > "$tmp/client.log" 2>&1 & pid=$!
   wait_reality_probe_ready "$pid" "$port" || { fail '无法启动临时出站测试。'; return 1; }
   if result="$(curl -sS --noproxy '' --proxy "socks5h://127.0.0.1:$port" --connect-timeout 8 --max-time 20 \
-    --head --output /dev/null --write-out 'HTTP %{http_code} / %{time_total}s' "$url" 2>/dev/null)"; then
-    info "出站 $(jq -r '.name' <<< "$record") 连接成功：$result"
+    --head --output /dev/null --write-out '%{http_code}\t%{time_total}' "$url" 2>/dev/null)"; then
+    IFS=$'\t' read -r http_code total_time <<< "$result"
+    latency_ms="$(jq -nr --arg seconds "$total_time" '$seconds | tonumber * 1000 | round')" || return 1
+    info "出站 $(jq -r '.name' <<< "$record") 连接成功 · 延迟 ${latency_ms} ms（HTTP $http_code）"
+    say "    测试地址：$url；延迟为经此出站完成 HTTP 请求的总耗时。"
   else fail "出站 $(jq -r '.name' <<< "$record") 连接失败。"; return 1; fi
 )
 
@@ -1871,7 +1874,7 @@ manage_outbound() {
   while get_network_item outbounds "$tag" >/dev/null; do
     ui_title '管理服务器出站'
     outbound_details "$tag"
-    ui_item 1 '测试此出站连接'
+    ui_item 1 '测试此出站连接 / 延迟'
     ui_item 2 '修改显示名称'
     ui_item 3 '用链接 / JSON 替换连接参数（保留标签）'
     ui_item 4 '启用 / 停用'
@@ -2147,7 +2150,7 @@ manage_balancer() {
     ui_title "负载均衡：$(jq -r '.name' <<< "$item")"
     jq '{tag,enabled,members,strategy:.config.strategy,fallback:.config.fallbackTag}' <<< "$item"
     ui_item 1 '修改成员 / 策略 / 回退出站'
-    ui_item 2 '逐个测试成员连接'
+    ui_item 2 '逐个测试成员连接 / 延迟'
     ui_item 3 '启用 / 停用'
     ui_item 4 '修改名称'
     ui_item 5 '导出均衡组 JSON'
