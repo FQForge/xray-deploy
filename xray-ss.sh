@@ -727,46 +727,69 @@ fetch_xray_archive() {
 # 在版本目录所在文件系统暂存，校验、解压和执行均成功后再原子替换文件。
 download_version() (
   set -euo pipefail
-  local tag="$1" dest="$CORE_DIR/$1" tmp archive
+  local tag="$1" dest="$CORE_DIR/$1" tmp archive rule core_cached=0
   valid_version "$tag" || { fail '版本号格式无效。'; exit 1; }
-  if [[ -x "$dest/xray" ]] && "$dest/xray" -version >/dev/null 2>&1; then exit 0; fi
+  if [[ -x "$dest/xray" ]] && "$dest/xray" -version >/dev/null 2>&1; then
+    if [[ -f "$dest/geosite.dat" && -s "$dest/geosite.dat" &&
+          -f "$dest/geoip.dat" && -s "$dest/geoip.dat" ]]; then
+      exit 0
+    fi
+    core_cached=1
+  fi
   mkdir -p "$CORE_DIR" || exit 1
   tmp="$(mktemp -d "$CORE_DIR/.install.XXXXXX")" || exit 1
   trap 'rm -rf "$tmp"' EXIT
-  archive="Xray-linux-${XRAY_ARCH}.zip"
-  info "正在下载 Xray $tag，处理器架构：$XRAY_ARCH……" >&2
-  fetch_xray_archive "$tag" "$XRAY_ARCH" "$tmp" || exit 1
-  if ! unzip -joq "$tmp/$archive" xray -d "$tmp"; then
-    warn 'Xray 安装包解压失败，已停止安装。'
-    exit 1
-  fi
-  chmod 755 "$tmp/xray" || exit 1
-  if ! "$tmp/xray" -version >/dev/null 2>&1; then
-    if [[ "$XRAY_ARCH" == mips32* ]]; then
-      # Prefer the in-archive soft-float binary where available (older releases).
-      if unzip -joq "$tmp/$archive" xray_softfloat -d "$tmp" >/dev/null 2>&1 &&
-         chmod 755 "$tmp/xray_softfloat" &&
-         "$tmp/xray_softfloat" -version >/dev/null 2>&1; then
-        mv -f "$tmp/xray_softfloat" "$tmp/xray" || exit 1
-      else
-        # Newer releases may publish a dedicated mips32-softfloat archive.
-        local soft_archive="Xray-linux-${XRAY_ARCH}-softfloat.zip"
-        fetch_xray_archive "$tag" "${XRAY_ARCH}-softfloat" "$tmp" || exit 1
-        unzip -joqo "$tmp/$soft_archive" xray -d "$tmp" || exit 1
-        chmod 755 "$tmp/xray" || exit 1
-      fi
-      if "$tmp/xray" -version >/dev/null 2>&1; then
-        info '当前 MIPS 设备已自动使用软浮点内核。' >&2
-      fi
-    fi
-    if ! "$tmp/xray" -version >/dev/null 2>&1; then
-      warn '下载的内核无法执行。请检查 CPU 架构、系统内核和官方发布包兼容性。'
+  if (( ! core_cached )); then
+    archive="Xray-linux-${XRAY_ARCH}.zip"
+    info "正在下载 Xray $tag，处理器架构：$XRAY_ARCH……" >&2
+    fetch_xray_archive "$tag" "$XRAY_ARCH" "$tmp" || exit 1
+    if ! unzip -joq "$tmp/$archive" xray -d "$tmp"; then
+      warn 'Xray 安装包解压失败，已停止安装。'
       exit 1
     fi
+    chmod 755 "$tmp/xray" || exit 1
+    if ! "$tmp/xray" -version >/dev/null 2>&1; then
+      if [[ "$XRAY_ARCH" == mips32* ]]; then
+        # Prefer the in-archive soft-float binary where available (older releases).
+        if unzip -joq "$tmp/$archive" xray_softfloat -d "$tmp" >/dev/null 2>&1 &&
+           chmod 755 "$tmp/xray_softfloat" &&
+           "$tmp/xray_softfloat" -version >/dev/null 2>&1; then
+          mv -f "$tmp/xray_softfloat" "$tmp/xray" || exit 1
+        else
+          # Newer releases may publish a dedicated mips32-softfloat archive.
+          local soft_archive="Xray-linux-${XRAY_ARCH}-softfloat.zip"
+          fetch_xray_archive "$tag" "${XRAY_ARCH}-softfloat" "$tmp" || exit 1
+          unzip -joqo "$tmp/$soft_archive" xray -d "$tmp" || exit 1
+          chmod 755 "$tmp/xray" || exit 1
+        fi
+        if "$tmp/xray" -version >/dev/null 2>&1; then
+          info '当前 MIPS 设备已自动使用软浮点内核。' >&2
+        fi
+      fi
+      if ! "$tmp/xray" -version >/dev/null 2>&1; then
+        warn '下载的内核无法执行。请检查 CPU 架构、系统内核和官方发布包兼容性。'
+        exit 1
+      fi
+    fi
   fi
+  info '正在下载 Loyalsoldier 路由规则文件……' >&2
+  for rule in geosite.dat geoip.dat; do
+    if ! curl -fLsS --retry 3 --connect-timeout 15 --max-time 240 \
+      -o "$tmp/$rule" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$rule" ||
+      [[ ! -s "$tmp/$rule" ]]; then
+      warn "下载 $rule 失败，已停止安装。请检查网络。"
+      exit 1
+    fi
+  done
+  chmod 644 "$tmp/geosite.dat" "$tmp/geoip.dat" || exit 1
   mkdir -p "$dest" || exit 1
-  mv -f "$tmp/xray" "$dest/xray" || exit 1
-  info "校验通过，Xray $tag 安装完成。" >&2
+  mv -f "$tmp/geosite.dat" "$tmp/geoip.dat" "$dest/" || exit 1
+  if (( core_cached )); then
+    info "已补齐 Xray $tag 的路由规则文件。" >&2
+  else
+    mv -f "$tmp/xray" "$dest/xray" || exit 1
+    info "校验通过，Xray $tag 安装完成。" >&2
+  fi
 )
 
 switch_version() {
