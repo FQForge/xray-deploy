@@ -32,6 +32,7 @@ LOG_FILE="${XSS_LOG_FILE:-/var/log/xray-ss.log}"
 PID_FILE="${XSS_PID_FILE:-/run/xray-ss.pid}"
 MANUAL_UNIT_FILE="${XSS_MANUAL_UNIT_FILE:-$OPT_DIR/standalone-service.sh}"
 GITHUB_API='https://api.github.com/repos/XTLS/Xray-core/releases'
+GEO_DATA_RELEASES='https://github.com/Loyalsoldier/v2ray-rules-dat/releases'
 # 默认安装目标版本；保留手动输入/选择其他版本的能力。
 DEFAULT_XRAY_VERSION='v26.6.1'
 # Reality 使用同一默认版本；候选站点仍需逐个通过实际隧道测试。
@@ -775,7 +776,7 @@ download_version() (
   info '正在下载 Loyalsoldier 路由规则文件……' >&2
   for rule in geosite.dat geoip.dat; do
     if ! curl -fLsS --retry 3 --connect-timeout 15 --max-time 240 \
-      -o "$tmp/$rule" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$rule" ||
+      -o "$tmp/$rule" "$GEO_DATA_RELEASES/latest/download/$rule" ||
       [[ ! -s "$tmp/$rule" ]]; then
       warn "下载 $rule 失败，已停止安装。请检查网络。"
       exit 1
@@ -792,11 +793,18 @@ download_version() (
   fi
 )
 
-switch_version() {
+lock_core_update() {
+  mkdir "$CORE_DIR/.update-lock" || fail '无法获取 Xray 更新锁，请检查是否有其他更新正在执行。'
+}
+
+switch_version() (
   local tag="$1" target="$CORE_DIR/$1/xray" old='' link_tmp
   valid_version "$tag" || { fail '版本号格式无效。'; return 1; }
   need_env || return 1
   init_config || return 1
+  lock_core_update || return 1
+  trap 'rmdir "$CORE_DIR/.update-lock"' EXIT
+  trap 'exit 1' HUP INT TERM
   install_service_unit || return 1
   download_version "$tag" || return 1
   "$target" run -test -format json -config "$CONFIG" || { fail "当前节点配置与 Xray $tag 不兼容，已取消切换。"; return 1; }
@@ -822,7 +830,118 @@ switch_version() {
     fi
   fi
   info "当前 Xray 版本：$tag"
+)
+
+fetch_geo_update() {
+  local directory="$1" release tag rule checksum expected actual url
+  release="$(curl -fLsS --retry 2 --connect-timeout 15 --max-time 30 -o /dev/null \
+    -w '%{url_effective}' "$GEO_DATA_RELEASES/latest")" || { fail '无法获取 Loyalsoldier 规则库的最新版本。'; return 1; }
+  tag="${release##*/}"
+  if [[ ! "$tag" =~ ^[0-9]{12}$ || "$release" != "$GEO_DATA_RELEASES/tag/$tag" ]]; then
+    fail '无法识别 Loyalsoldier 规则库的最新版本。'; return 1
+  fi
+  info "正在下载 Loyalsoldier 规则库 $tag……"
+  for rule in geosite.dat geoip.dat; do
+    url="$GEO_DATA_RELEASES/download/$tag/$rule"
+    if ! curl -fLsS --retry 3 --connect-timeout 15 --max-time 240 -o "$directory/$rule" "$url" ||
+       ! checksum="$(curl -fLsS --retry 3 --connect-timeout 15 --max-time 60 "$url.sha256sum")" ||
+       [[ ! -s "$directory/$rule" ]]; then
+      fail "下载 $rule 或其校验文件失败。"; return 1
+    fi
+    read -r expected _ <<< "$checksum"
+    actual="$(cd "$directory" && sha256sum "$rule")" || return 1
+    if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ || "${actual%% *}" != "${expected,,}" ]]; then
+      fail "$rule 的 SHA256 校验失败。"; return 1
+    fi
+  done
+  chmod 644 "$directory/geosite.dat" "$directory/geoip.dat"
 }
+
+update_geo_data() (
+  local core versions dest tag tmp='' path rule unit tool
+  local replacing=0 restart_attempted=0 was_active=0
+  need_core || exit 1
+  [[ -r "$CONFIG" ]] || { fail '找不到可读取的 Xray 运行配置。'; exit 1; }
+  [[ -n "$INIT_SYSTEM" ]] || detect_init_system || exit 1
+  for tool in curl sha256sum; do
+    command -v "$tool" >/dev/null || { fail "缺少更新规则库所需的命令：$tool。"; exit 1; }
+  done
+  lock_core_update || exit 1
+  cleanup_geo_update() {
+    local rule restore_failed=0
+    trap '' HUP INT TERM
+    if (( replacing )); then
+      for rule in geosite.dat geoip.dat; do
+        if [[ -e "$tmp/previous/$rule" || -L "$tmp/previous/$rule" ]]; then
+          mv -f "$tmp/previous/$rule" "$dest/$rule" || restore_failed=1
+        else
+          rm -f "$dest/$rule" || restore_failed=1
+        fi
+      done
+      if (( restore_failed )); then
+        warn "规则库未能完整恢复，剩余备份位于 $tmp/previous。"
+      else
+        warn '已恢复更新前的规则库。'
+        if (( restart_attempted )) && { ! service_restart || ! service_is_active; }; then
+          warn '原规则库已恢复，Xray 服务仍未启动。'
+        fi
+      fi
+    fi
+    if [[ -n "$tmp" ]] && (( ! restore_failed )); then rm -rf "$tmp"; fi
+    rmdir "$CORE_DIR/.update-lock"
+  }
+  trap cleanup_geo_update EXIT
+  trap 'exit 1' HUP INT TERM
+  versions="$(readlink -f "$CORE_DIR")" || exit 1
+  core="$(readlink -f "$CORE_LINK")" || exit 1
+  dest="${core%/*}"
+  tag="${dest##*/}"
+  if [[ "$core" != "$versions/$tag/xray" ]] || ! valid_version "$tag"; then
+    fail '当前 Xray 内核不在本工具的版本目录中。'; exit 1
+  fi
+  unit="$(service_unit_path)" || exit 1
+  if [[ -e "$unit" || -L "$unit" ]]; then check_managed_service_file "$unit" || exit 1; fi
+  tmp="$(mktemp -d "$dest/.geo-update.XXXXXX")" || exit 1
+  mkdir "$tmp/new" "$tmp/previous" || exit 1
+  fetch_geo_update "$tmp/new" || exit 1
+  if command -v cmp >/dev/null && cmp -s "$tmp/new/geosite.dat" "$dest/geosite.dat" &&
+     cmp -s "$tmp/new/geoip.dat" "$dest/geoip.dat"; then
+    info "Xray $tag 的 GeoSite / GeoIP 已是最新版本。"
+    exit 0
+  fi
+
+  # 校验时让 ext: 规则仍可读取当前内核目录里的其他资源。
+  shopt -s nullglob dotglob
+  for path in "$dest"/*; do
+    case "$path" in "$tmp"|"$dest/geosite.dat"|"$dest/geoip.dat") continue ;; esac
+    ln -s "$path" "$tmp/new/" || exit 1
+  done
+  if ! env "xray.location.asset=$tmp/new" "$core" run -test -format json -config "$CONFIG"; then
+    fail '新规则库与当前 Xray 配置不兼容，已取消更新。'; exit 1
+  fi
+  for rule in geosite.dat geoip.dat; do
+    path="$dest/$rule"
+    if [[ -e "$path" || -L "$path" ]]; then
+      if [[ -d "$path" || ( ! -f "$path" && ! -L "$path" ) ]]; then
+        fail "规则库路径不是文件：$path。"; exit 1
+      fi
+      cp -pP "$path" "$tmp/previous/$rule" || exit 1
+    fi
+  done
+  if service_is_active; then was_active=1; fi
+  replacing=1
+  for rule in geosite.dat geoip.dat; do
+    mv -f "$tmp/new/$rule" "$dest/$rule" || { fail "无法写入 $rule。"; exit 1; }
+  done
+  if (( was_active )); then
+    restart_attempted=1
+    if ! service_restart || ! service_is_active; then
+      fail '更新后 Xray 服务未能启动，正在恢复原规则库。'; exit 1
+    fi
+  fi
+  replacing=0
+  info "Xray $tag 的 GeoSite / GeoIP 已更新。"
+)
 
 port_in_use() {
   local port="$1"
@@ -2101,8 +2220,9 @@ routing_menu() {
     ui_item 7 '域名解析策略'
     ui_item 8 '入站 HTTP / TLS / QUIC 嗅探'
     ui_item 9 '恢复网络配置备份'
+    ui_item 10 '更新 GeoSite / GeoIP 规则库'
     ui_back
-    read -r -p '请选择 [1-9 / 0]：' answer || return 0
+    read -r -p '请选择 [1-10 / 0]：' answer || return 0
     case "$answer" in
       1) rule_wizard || true ;;
       2) if key="$(choose_network_item rules)"; then manage_rule "$key"; fi ;;
@@ -2113,6 +2233,7 @@ routing_menu() {
       7) set_routing_strategy || true ;;
       8) set_inbound_sniffing || true ;;
       9) restore_network_backup || true ;;
+      10) update_geo_data || true ;;
       0|'') return 0 ;;
       *) warn '请输入菜单中的序号。' ;;
     esac
@@ -3989,6 +4110,7 @@ Xray 中文节点管理系统（SS / SS2022 / VLESS + Reality / SOCKS5 / HTTP）
       sudo xnode balancers     # 负载均衡和健康探测
       sudo xnode outbound-import FILE  # 从文件导入出站（- 表示标准输入）
       sudo xnode rule-import FILE      # 从文件导入规则
+      sudo xnode geo-update    # 更新当前内核的 GeoSite / GeoIP 规则库
       sudo xnode status        # 查看服务状态
       sudo xnode logs          # 查看运行日志
       sudo xnode logs on       # 开启警告 / 错误日志（默认关闭）
@@ -4035,6 +4157,7 @@ main() {
     --help|-h|help) usage; return 0 ;;
     check) check_compatibility; return $? ;;
     ddns-update) require_root || return 1; ddns_update; return $? ;;
+    geo-update) require_root || return 1; update_geo_data; return $? ;;
     diagnose)
       require_root || return 1
       detect_init_system || return 1
