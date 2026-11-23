@@ -3472,7 +3472,7 @@ show_node_connection() {
   say ''
   if [[ -n "$panel_uri" ]]; then
     say 'SS2022 兼容导入链接'
-    say '  出站导入　3x-ui、xnode'
+    say '  出站导入　3x-ui、S-UI、xnode'
     say '  节点导入　v2rayA、OpenWrt PassWall / PassWall2（使用 Xray 内核）'
     printf '%s\n' "$panel_uri"
     say ''
