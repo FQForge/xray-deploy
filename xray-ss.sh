@@ -3471,7 +3471,12 @@ show_node_connection() {
   esac
   say ''
   if [[ -n "$panel_uri" ]]; then
-    say '服务器出站导入链接（用于 3x-ui 出站和 xnode 的「服务器出站」）'
+    say 'SS2022 兼容导入链接'
+    say '  3x-ui → 出站页面 → 导入出站'
+    say '  xnode → 服务器出站 → 导入协议链接 / JSON'
+    say '  v2rayA → 导入 → 节点链接（使用 Xray 内核）'
+    say '  OpenWrt PassWall / PassWall2 → 节点列表 → 通过链接添加节点'
+    say '    在「节点订阅」中将「Shadowsocks 节点使用类型」设为 Xray。'
     printf '%s\n' "$panel_uri"
     say ''
     say 'SS2022 标准分享链接（用于 v2rayN、v2rayNG、NekoBox、Hiddify 等客户端）'
