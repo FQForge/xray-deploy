@@ -3469,13 +3469,15 @@ show_node_connection() {
       fi
       ;;
   esac
-  if [[ -n "$panel_uri" ]]; then
-    say ''
-    say '3x-ui 出站导入链接：'
-    printf '%s\n' "$panel_uri"
-  fi
   say ''
-  say '客户端分享链接：'
+  if [[ -n "$panel_uri" ]]; then
+    say '服务器出站导入链接（用于 3x-ui 出站和 xnode 的「服务器出站」）'
+    printf '%s\n' "$panel_uri"
+    say ''
+    say 'SS2022 标准分享链接（用于 v2rayN、v2rayNG、NekoBox、Hiddify 等客户端）'
+  else
+    say '客户端分享链接：'
+  fi
   printf '%s\n' "$uri"
   warn '分享链接包含连接凭据，请妥善保管。'
 }
