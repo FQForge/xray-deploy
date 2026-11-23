@@ -1155,15 +1155,22 @@ apply_runtime_config() {
   info "$message，原配置已备份：$backup" >&2
 }
 
-# 默认关闭日志，同时补齐旧版 DNS；显式开启和自定义配置均保留。
+# 补齐默认日志和 DNS，并统一受管 Shadowsocks 入站的客户端字段。
 migrate_default_config() {
   local candidate
   candidate="$(mktemp "$ETC_DIR/.defaults.XXXXXX.json")" || return 1
-  if ! with_default_dns "$CONFIG" | with_default_logging > "$candidate"; then
+  if ! with_default_dns "$CONFIG" | with_default_logging |
+    jq --slurpfile managed "$INBOUNDS_FILE" '
+      [$managed[0].inbounds[] | select(.config.protocol=="shadowsocks") | .tag] as $tags |
+      (.inbounds[] | select(.protocol=="shadowsocks" and .settings.clients==null and
+        (.settings.users|type)=="array") |
+        select(.tag as $tag | $tags | index($tag)!=null) | .settings) |=
+        (.clients=.users | del(.users))
+    ' > "$candidate"; then
     rm -f "$candidate"
     fail '无法生成默认运行设置，原配置保持不变。'; return 1
   fi
-  apply_runtime_config "$candidate" '已更新默认日志 / DNS 设置'
+  apply_runtime_config "$candidate" '已更新运行配置'
 }
 
 set_logging() {
@@ -1273,6 +1280,7 @@ render_inbound_config() {
       if .protocol=="vless" then .settings.clients=$a
       elif .protocol=="socks" or .protocol=="http" then .settings.accounts=$a
       elif $i.mode=="single" then .settings.password=$a[0].password
+      elif .protocol=="shadowsocks" then .settings.clients=$a
       else .settings.users=$a end;
     ([$old[0].inbounds[].tag, $state[0].inbounds[].tag] | unique) as $managed |
     .inbounds=([.inbounds[] | select(.tag as $t | $managed | index($t) | not)] +
@@ -2569,8 +2577,8 @@ create_node() {
     --arg pass "$pass" --arg server "$server_pass" --arg network "$network" --arg listen "$listen" '
     {tag:$tag,listen:$listen,port:$port,protocol:"shadowsocks",settings:{method:$method,network:$network}} |
     if $method=="2022-blake3-chacha20-poly1305" then .settings.password=$pass
-    elif ($method|startswith("2022-")) then .settings += {password:$server,users:[{password:$pass}]}
-    else .settings.users=[{method:$method,password:$pass}] end')" || return 1
+    elif ($method|startswith("2022-")) then .settings += {password:$server,clients:[{password:$pass}]}
+    else .settings.clients=[{method:$method,password:$pass}] end')" || return 1
   [[ -n "$meta" ]] || meta='{}'
   commit_new_node "$tag" "$node" "$host" "$meta"
 }
@@ -3386,10 +3394,13 @@ node_share_host() {
   detect_public_host || fail "无法确定节点 $tag 的公网地址。"
 }
 
-# SIP002: legacy AEAD uses base64url userinfo; SS2022 MUST use plain percent-encoded userinfo.
 make_ss_uri() {
   local method="$1" password="$2" host="$3" port="$4" name="$5" userinfo hostpart label
-  if [[ "$method" == 2022-* ]]; then
+  if [[ "${6:-}" == 3x-ui ]]; then
+    # Some 3x-ui versions decode only Base64 userinfo. Wrap the raw PSKs and their separator.
+    userinfo="$(jq -rn --arg auth "$method:$password" '$auth|@base64')" || return 1
+  elif [[ "$method" == 2022-* ]]; then
+    # SIP002 uses percent-encoded userinfo for standard SS2022 links.
     userinfo="${method}:$(jq -rn --arg p "$password" '$p|@uri')"
   else
     userinfo="$(printf '%s' "${method}:${password}" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')"
@@ -3418,7 +3429,7 @@ show_inbound_summary() {
 }
 
 show_node_connection() {
-  local tag="$1" key="${2:-}" ctx host public_port uri protocol
+  local tag="$1" key="${2:-}" ctx host public_port uri protocol method password display panel_uri=''
   if [[ -z "$key" ]]; then key="$(choose_client "$tag" auto)" || return $?; fi
   ctx="$(client_context "$tag" "$key")" || return 1
   uri="$(make_node_uri "$tag" "$key")" || return 1
@@ -3447,11 +3458,22 @@ show_node_connection() {
       say "代理密码：$(jq -r '.account.pass' <<< "$ctx")"
       ;;
     shadowsocks)
-      say "加密方式：$(jq -r '.method' <<< "$ctx")"
-      say "连接密码：$(jq -r '.password' <<< "$ctx")"
+      method="$(jq -er '.method' <<< "$ctx")" || return 1
+      password="$(jq -er '.password' <<< "$ctx")" || return 1
+      say "加密方式：$method"
+      say "连接密码：$password"
       say "传输方式：$(jq -r '.node.settings.network // "tcp"' <<< "$ctx")"
+      if [[ "$method" == 2022-* ]]; then
+        display="$(jq -er '.display' <<< "$ctx")" || return 1
+        panel_uri="$(make_ss_uri "$method" "$password" "$host" "$public_port" "$display" 3x-ui)" || return 1
+      fi
       ;;
   esac
+  if [[ -n "$panel_uri" ]]; then
+    say ''
+    say '3x-ui 出站导入链接：'
+    printf '%s\n' "$panel_uri"
+  fi
   say ''
   say '客户端分享链接：'
   printf '%s\n' "$uri"
@@ -4065,11 +4087,12 @@ menu() {
     ui_section '维护'
     ui_item 8 '服务管理（状态 / 重启 / 日志）'
     ui_item 9 '高级设置（自定义创建 / 内核 / DDNS / 卸载）'
+    ui_item 10 '更新 GeoSite / GeoIP 规则库'
     ui_back '退出管理系统'
     say '  连接节点 = 入站的地址和端口 + 客户端凭据；一个入站可管理多个客户端。'
     say '  NAT 请先查看服务商/路由器分配的端口；动态 IP 请选择 DDNS。'
     say ''
-    read -r -p '请选择 [1-9 / 0]：' ans || return 0
+    read -r -p '请选择 [1-10 / 0]：' ans || return 0
     case "$ans" in
       1) quick_add_node || true ;;
       2) links_menu || true ;;
@@ -4086,9 +4109,10 @@ menu() {
           [[ "$result" != 10 ]] || return 0
         fi
         ;;
+      10) update_geo_data || true ;;
       0) return 0 ;;
       '') continue ;;
-      *) warn '请输入 1～9，或输入 0 退出。' ;;
+      *) warn '请输入 1～10，或输入 0 退出。' ;;
     esac
   done
 }
